@@ -4,7 +4,8 @@ Run [Fish Audio Drama 3](https://huggingface.co/fishaudio/drama-3) (35B-A3B MoE 
 
 **Built with Fish Audio.** The Drama 3 weights are licensed under the Fish Audio Community License v1.0, not under this repository's code license.
 
-- Status: work in progress. See [docs/PLAN.md](docs/PLAN.md) (Japanese) for the plan and progress.
+- **Start here:** [docs/drama3-lowmem.md](docs/drama3-lowmem.md) — how it works, results (RTF 0.3 on an RTX 5090 with 9 of 40 expert layers in RAM), accuracy against an FP32 reference, quick start and memory guide.
+- Plan and progress (Japanese): [docs/PLAN.md](docs/PLAN.md).
 - Base: this repository is derived from [JarodMica/audio.cpp](https://github.com/JarodMica/audio.cpp) branch `drama-3-native` (commit `4dbb4d1`), which is a fork of [0xShug0/audio.cpp](https://github.com/0xShug0/audio.cpp). The code remains under the Apache License 2.0 (see [LICENSE](LICENSE)). The original audio.cpp README follows below.
 
 ---

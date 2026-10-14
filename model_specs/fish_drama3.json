@@ -85,10 +85,10 @@
       {
         "name": "text_chunk_size",
         "type": "int",
-        "description": "Maximum characters per long-form chunk.",
+        "description": "Maximum characters per long-form chunk. drama3-lowmem default 60 (about one sentence), which avoids the stalls and skipped sentences seen with longer chunks.",
         "required": false,
         "min": 1,
-        "default": 200
+        "default": 60
       },
       {
         "name": "text_chunk_mode",
@@ -141,7 +141,7 @@
       {
         "name": "stall_retries",
         "type": "int",
-        "description": "drama3-lowmem: offline only, regenerate a stalled chunk up to this many times with another seed.",
+        "description": "drama3-lowmem: offline only, regenerate a stalled or early-ended chunk up to this many times with another seed.",
         "required": false,
         "min": 0,
         "default": 2
@@ -152,6 +152,14 @@
         "description": "drama3-lowmem: generate each <|speaker:N|> turn as its own chunk, continuing from the previous one. On by default: in a 8-seed test two-speaker dialogues finished completely 8/8 with it and 4/8 without.",
         "required": false,
         "default": true
+      },
+      {
+        "name": "min_seconds_per_char",
+        "type": "float",
+        "description": "drama3-lowmem: offline only, regenerate a chunk whose audio is shorter than this many seconds per spoken character (an early stop); 0 disables.",
+        "required": false,
+        "min": 0,
+        "default": 0.02
       }
     ],
     "session": [

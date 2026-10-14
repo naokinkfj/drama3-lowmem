@@ -1,0 +1,66 @@
+[
+ {
+  "name": "en_long_s1",
+  "language": "en",
+  "text": "Running a large speech model at home used to require a data center graphics card. This project keeps the most frequently used parts of the model on the graphics card and the rest in ordinary memory. It is a little slower, but the voice sounds exactly as the original model intended. Podcasts, audiobooks and games can now be voiced on a single desktop computer.",
+  "options": {
+   "seed": "1"
+  }
+ },
+ {
+  "name": "en_long_s2",
+  "language": "en",
+  "text": "Running a large speech model at home used to require a data center graphics card. This project keeps the most frequently used parts of the model on the graphics card and the rest in ordinary memory. It is a little slower, but the voice sounds exactly as the original model intended. Podcasts, audiobooks and games can now be voiced on a single desktop computer.",
+  "options": {
+   "seed": "2"
+  }
+ },
+ {
+  "name": "en_long_s3",
+  "language": "en",
+  "text": "Running a large speech model at home used to require a data center graphics card. This project keeps the most frequently used parts of the model on the graphics card and the rest in ordinary memory. It is a little slower, but the voice sounds exactly as the original model intended. Podcasts, audiobooks and games can now be voiced on a single desktop computer.",
+  "options": {
+   "seed": "3"
+  }
+ },
+ {
+  "name": "en_long_s4",
+  "language": "en",
+  "text": "Running a large speech model at home used to require a data center graphics card. This project keeps the most frequently used parts of the model on the graphics card and the rest in ordinary memory. It is a little slower, but the voice sounds exactly as the original model intended. Podcasts, audiobooks and games can now be voiced on a single desktop computer.",
+  "options": {
+   "seed": "4"
+  }
+ },
+ {
+  "name": "en_long_s5",
+  "language": "en",
+  "text": "Running a large speech model at home used to require a data center graphics card. This project keeps the most frequently used parts of the model on the graphics card and the rest in ordinary memory. It is a little slower, but the voice sounds exactly as the original model intended. Podcasts, audiobooks and games can now be voiced on a single desktop computer.",
+  "options": {
+   "seed": "5"
+  }
+ },
+ {
+  "name": "en_long_s6",
+  "language": "en",
+  "text": "Running a large speech model at home used to require a data center graphics card. This project keeps the most frequently used parts of the model on the graphics card and the rest in ordinary memory. It is a little slower, but the voice sounds exactly as the original model intended. Podcasts, audiobooks and games can now be voiced on a single desktop computer.",
+  "options": {
+   "seed": "6"
+  }
+ },
+ {
+  "name": "en_long_s7",
+  "language": "en",
+  "text": "Running a large speech model at home used to require a data center graphics card. This project keeps the most frequently used parts of the model on the graphics card and the rest in ordinary memory. It is a little slower, but the voice sounds exactly as the original model intended. Podcasts, audiobooks and games can now be voiced on a single desktop computer.",
+  "options": {
+   "seed": "7"
+  }
+ },
+ {
+  "name": "en_long_s8",
+  "language": "en",
+  "text": "Running a large speech model at home used to require a data center graphics card. This project keeps the most frequently used parts of the model on the graphics card and the rest in ordinary memory. It is a little slower, but the voice sounds exactly as the original model intended. Podcasts, audiobooks and games can now be voiced on a single desktop computer.",
+  "options": {
+   "seed": "8"
+  }
+ }
+]

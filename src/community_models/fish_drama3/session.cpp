@@ -5,6 +5,7 @@
 #include "engine/framework/text/chunking.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <iostream>
 #include <stdexcept>
@@ -48,6 +49,27 @@ std::vector<runtime::TaskRequest> speaker_turns(const runtime::TaskRequest & req
         begin = next;
     }
     return turns.empty() ? std::vector<runtime::TaskRequest>{request} : turns;
+}
+
+// Codepoints that are spoken: tags such as <|speaker:0|> or [laughs], white
+// space and ASCII punctuation are left out.
+int64_t spoken_codepoints(const std::string & text) {
+    int64_t count = 0;
+    for (size_t i = 0; i < text.size();) {
+        if (text.compare(i, 2, "<|") == 0) {
+            const size_t end = text.find("|>", i + 2);
+            if (end != std::string::npos) { i = end + 2; continue; }
+        }
+        if (text[i] == '[') {
+            const size_t end = text.find(']', i + 1);
+            if (end != std::string::npos) { i = end + 1; continue; }
+        }
+        const auto byte = static_cast<unsigned char>(text[i]);
+        const size_t width = byte < 0x80 ? 1 : byte < 0xE0 ? 2 : byte < 0xF0 ? 3 : 4;
+        if (byte >= 0x80 || std::isalnum(byte)) ++count;
+        i += width;
+    }
+    return count;
 }
 
 runtime::AudioBuffer read_reference(const std::string & path) {
@@ -137,6 +159,9 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
     // (usually silence) is stopped and, offline, regenerated with another seed.
     sampling.stall_frames = runtime::parse_i64_option(effective.options, {"stall_frames"}).value_or(64);
     const int64_t retries = runtime::parse_i64_option(effective.options, {"stall_retries"}).value_or(2);
+    // A take far shorter than its text (default under 0.02 s per spoken
+    // character, a fifth of fast English speech) ended early; it is retried too.
+    const float min_seconds_per_char = runtime::parse_finite_float_option(effective.options, {"min_seconds_per_char"}).value_or(0.02F);
     const bool split_turns = runtime::parse_bool_option(
         runtime::find_option(effective.options, {"split_speaker_turns"}).value_or("true"), "split_speaker_turns");
     std::vector<Drama3Take> references;
@@ -195,7 +220,11 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
             append_take(descriptors);
         }
     }
-    const int64_t chunk_size = runtime::parse_positive_i64_option(effective.options, {"text_chunk_size"}, 200);
+    // drama3-lowmem: about one sentence per chunk (60 codepoints) instead of
+    // 200. Over 8 seeds of a 182-character Japanese paragraph, 200 stalled 5
+    // times and lost text twice even with retries, 100 skipped a sentence once,
+    // and 60 completed 8/8 without a retry.
+    const int64_t chunk_size = runtime::parse_positive_i64_option(effective.options, {"text_chunk_size"}, 60);
     const auto mode = engine::text::parse_text_chunk_mode_override(effective.options).value_or(engine::text::TextChunkMode::TagAware);
     std::vector<runtime::TaskRequest> chunks;
     for (const auto & turn : split_turns ? speaker_turns(effective) : std::vector<runtime::TaskRequest>{effective}) {
@@ -221,9 +250,16 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
         }
         const auto & text = chunks[index].text_input->text;
         auto generated = generator_->generate(text, references, context, chunk_sampling, streaming, callback);
+        const double min_seconds = min_seconds_per_char * static_cast<double>(spoken_codepoints(text));
+        const auto failed = [&](const Drama3Generation & take) {
+            const double seconds = take.audio.sample_rate > 0
+                ? static_cast<double>(take.audio.samples.size()) / take.audio.sample_rate : 0.0;
+            return take.stalled || (!take.reached_limit && seconds < min_seconds);
+        };
         // Streamed audio has already left, so only offline takes are retried.
-        for (int64_t attempt = 1; generated.stalled && !streaming && attempt <= retries; ++attempt) {
-            std::cerr << "[fish_drama3] take stalled; regenerating chunk " << index << " (attempt " << attempt << ")\n";
+        for (int64_t attempt = 1; failed(generated) && !streaming && attempt <= retries; ++attempt) {
+            std::cerr << "[fish_drama3] take " << (generated.stalled ? "stalled" : "ended early")
+                      << "; regenerating chunk " << index << " (attempt " << attempt << ")\n";
             chunk_sampling.seed += 7919U;
             generated = generator_->generate(text, references, context, chunk_sampling, streaming, callback);
         }
