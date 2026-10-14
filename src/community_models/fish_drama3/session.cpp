@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <iostream>
 #include <stdexcept>
 
 namespace engine::models::fish_drama3 {
@@ -30,6 +31,23 @@ codecs::FishDacCodes parse_codes(const json::Value & value, int64_t codebook_siz
     }
     validate_drama3_codes(codes, codebook_size);
     return codes;
+}
+
+// Splits "<|speaker:0|>a<|speaker:1|>b" into one request per speaker turn, so
+// each turn is generated as a continuation of the previous one.
+std::vector<runtime::TaskRequest> speaker_turns(const runtime::TaskRequest & request) {
+    const std::string & text = request.text_input->text;
+    std::vector<runtime::TaskRequest> turns;
+    size_t begin = 0;
+    while (begin < text.size()) {
+        size_t next = text.find("<|speaker:", begin + 1);
+        if (next == std::string::npos) next = text.size();
+        auto turn = request;
+        turn.text_input->text = text.substr(begin, next - begin);
+        if (turn.text_input->text.find_first_not_of(" \t\r\n") != std::string::npos) turns.push_back(std::move(turn));
+        begin = next;
+    }
+    return turns.empty() ? std::vector<runtime::TaskRequest>{request} : turns;
 }
 
 runtime::AudioBuffer read_reference(const std::string & path) {
@@ -115,6 +133,12 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
     sampling.top_k = runtime::parse_int_option(effective.options, {"top_k"}).value_or(30);
     sampling.max_frames = runtime::parse_positive_i64_option(effective.options, {"max_tokens", "max_new_tokens"}, 1024);
     sampling.seed = runtime::parse_u32_option(effective.options, {"seed"}).value_or(runtime::random_u32_seed());
+    // drama3-lowmem quality guard: a take that gets stuck repeating one frame
+    // (usually silence) is stopped and, offline, regenerated with another seed.
+    sampling.stall_frames = runtime::parse_i64_option(effective.options, {"stall_frames"}).value_or(64);
+    const int64_t retries = runtime::parse_i64_option(effective.options, {"stall_retries"}).value_or(2);
+    const bool split_turns = runtime::parse_bool_option(
+        runtime::find_option(effective.options, {"split_speaker_turns"}).value_or("true"), "split_speaker_turns");
     std::vector<Drama3Take> references;
     if (effective.voice && effective.voice->speaker && effective.voice->speaker->cached_voice_id &&
         !effective.voice->speaker->audio) {
@@ -173,7 +197,10 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
     }
     const int64_t chunk_size = runtime::parse_positive_i64_option(effective.options, {"text_chunk_size"}, 200);
     const auto mode = engine::text::parse_text_chunk_mode_override(effective.options).value_or(engine::text::TextChunkMode::TagAware);
-    const auto chunks = runtime::chunk_text_request(effective, chunk_size, mode);
+    std::vector<runtime::TaskRequest> chunks;
+    for (const auto & turn : split_turns ? speaker_turns(effective) : std::vector<runtime::TaskRequest>{effective}) {
+        for (auto & chunk : runtime::chunk_text_request(turn, chunk_size, mode)) chunks.push_back(std::move(chunk));
+    }
     runtime::TaskResult result;
     runtime::AudioBuffer merged;
     std::vector<Drama3Take> generated_takes;
@@ -194,6 +221,12 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
         }
         const auto & text = chunks[index].text_input->text;
         auto generated = generator_->generate(text, references, context, chunk_sampling, streaming, callback);
+        // Streamed audio has already left, so only offline takes are retried.
+        for (int64_t attempt = 1; generated.stalled && !streaming && attempt <= retries; ++attempt) {
+            std::cerr << "[fish_drama3] take stalled; regenerating chunk " << index << " (attempt " << attempt << ")\n";
+            chunk_sampling.seed += 7919U;
+            generated = generator_->generate(text, references, context, chunk_sampling, streaming, callback);
+        }
         runtime::append_audio_buffer(merged, generated.audio);
         limited = limited || generated.reached_limit;
         generated_takes.push_back({text, std::move(generated.codes)});

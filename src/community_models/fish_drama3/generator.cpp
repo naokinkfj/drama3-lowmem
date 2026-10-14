@@ -7,11 +7,14 @@
 #include <algorithm>
 #include <cmath>
 #include <chrono>
+#include <condition_variable>
 #include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <sstream>
+#include <thread>
 #include <numeric>
 #include <random>
 #include <stdexcept>
@@ -76,6 +79,82 @@ std::vector<Drama3Frame> read_frames(const std::filesystem::path & path) {
     return out;
 }
 
+// Offline takes decode each frame through the streaming codec graph on its
+// own thread while generation continues. The codec has its own backend, and
+// the GPU otherwise idles while CPU-resident experts run.
+class BackgroundCodec {
+public:
+    explicit BackgroundCodec(codecs::FishDacCodecRuntime & codec) : codec_(codec) {
+        codec_.reset_decode_stream();
+        worker_ = std::thread([this] { run(); });
+    }
+
+    ~BackgroundCodec() {
+        if (!worker_.joinable()) return;
+        // Unwinding from an error: stop the worker without rethrowing its own.
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            closed_ = true;
+            pending_.clear();
+        }
+        ready_.notify_one();
+        worker_.join();
+    }
+
+    void push(const Drama3Frame & frame) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            pending_.push_back(frame);
+        }
+        ready_.notify_one();
+    }
+
+    // Waits for every pushed frame and returns the decoded audio.
+    runtime::AudioBuffer finish() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            closed_ = true;
+        }
+        ready_.notify_one();
+        worker_.join();
+        codec_.reset_decode_stream();
+        if (error_) std::rethrow_exception(error_);
+        return std::move(audio_);
+    }
+
+private:
+    void run() {
+        try {
+            for (;;) {
+                Drama3Frame frame;
+                {
+                    std::unique_lock<std::mutex> lock(mutex_);
+                    ready_.wait(lock, [this] { return closed_ || !pending_.empty(); });
+                    if (pending_.empty()) return;
+                    frame = pending_.front();
+                    pending_.pop_front();
+                }
+                codecs::FishDacCodes codes;
+                codes.codebooks = 10;
+                codes.frames = 1;
+                codes.codes.assign(frame.begin() + 1, frame.end());
+                runtime::append_audio_buffer(audio_, codec_.decode_stream(codes));
+            }
+        } catch (...) {
+            error_ = std::current_exception();
+        }
+    }
+
+    codecs::FishDacCodecRuntime & codec_;
+    std::thread worker_;
+    std::mutex mutex_;
+    std::condition_variable ready_;
+    std::deque<Drama3Frame> pending_;
+    bool closed_ = false;
+    runtime::AudioBuffer audio_;
+    std::exception_ptr error_;
+};
+
 std::vector<float> last_hidden(const std::vector<float> & values, int64_t width) {
     if (values.size() < static_cast<size_t>(width)) throw std::runtime_error("Drama 3 backbone returned too few hidden values");
     return {values.end() - width, values.end()};
@@ -93,6 +172,9 @@ Drama3Generator::Drama3Generator(std::shared_ptr<const Drama3Assets> assets,
     }
     auto backbone_config = assets_->backbone;
     backbone_config.decode_cache_steps = cache_steps_;
+    backbone_config.lm_head_eos = assets_->eos;
+    backbone_config.lm_head_first = assets_->tower.semantic_begin;
+    backbone_config.lm_head_count = static_cast<int32_t>(assets_->tower.codebook_size);
     backbone_config.cpu_expert_layers = runtime::parse_i64_option(options.options, {"fish_drama3.cpu_expert_layers"}).value_or(4);
     if (const auto value = runtime::find_option(options.options, {"fish_drama3.profile_steps"})) {
         profile_steps_ = runtime::parse_bool_option(*value, "fish_drama3.profile_steps");
@@ -210,6 +292,9 @@ Drama3Generation Drama3Generator::generate(const std::string & text, const std::
     const auto teacher = teacher_frames_path_.empty() ? std::vector<Drama3Frame>{} : read_frames(teacher_frames_path_);
     std::vector<float> dump_hidden, dump_semantic, dump_residual;
     std::deque<int32_t> recent;
+    int64_t repeat_run = 0;
+    std::optional<BackgroundCodec> background_codec;
+    if (!streaming && offline_codec_stream_) background_codec.emplace(*codec_);
     std::vector<Drama3Frame> output_frames;
     Drama3Generation result;
     if (streaming) codec_->reset_decode_stream();
@@ -259,6 +344,15 @@ Drama3Generation Drama3Generator::generate(const std::string & text, const std::
         if (dumping) dump_residual.insert(dump_residual.end(), drawn.logits.begin(), drawn.logits.end());
         output_frames.push_back(next);
         split(tower_ms);
+        repeat_run = !output_frames.empty() && output_frames.size() > 1 && output_frames[output_frames.size() - 2][0] == next[0]
+            ? repeat_run + 1 : 1;
+        if (sampling.stall_frames > 0 && repeat_run >= sampling.stall_frames && teacher.empty()) {
+            // Keep a short pause of the repeated frame and drop the rest.
+            output_frames.resize(output_frames.size() - static_cast<size_t>(repeat_run) + std::min<size_t>(repeat_run, 8));
+            result.stalled = true;
+            break;
+        }
+        if (background_codec) background_codec->push(next);
         if (step == 0) mark_phase("tower_first_frame_ms");
         recent.push_back(next[0]);
         if (recent.size() > 16) recent.pop_front();
@@ -327,19 +421,14 @@ Drama3Generation Drama3Generator::generate(const std::string & text, const std::
         for (size_t row = 0; row < output_frames.size(); ++row) result.codes.codes[book * output_frames.size() + row] = output_frames[row][book + 1];
     }
     const auto codec_started = ProfileClock::now();
-    if (!streaming && offline_codec_stream_) {
-        // drama3-lowmem: decode through the causal streaming graph one frame at
+    if (background_codec) {
+        // drama3-lowmem: frames went through the causal streaming graph one at
         // a time. Its memory does not grow with the take, whereas the
         // whole-take graph needed about 8 GiB of VRAM for a 30 s take.
-        codec_->reset_decode_stream();
-        for (const auto & frame : output_frames) {
-            codecs::FishDacCodes codes;
-            codes.codebooks = 10;
-            codes.frames = 1;
-            codes.codes.assign(frame.begin() + 1, frame.end());
-            runtime::append_audio_buffer(result.audio, codec_->decode_stream(codes));
-        }
-        codec_->reset_decode_stream();
+        result.audio = background_codec->finish();
+        // A stalled take was cut back after its frames were queued.
+        const size_t samples = output_frames.size() * static_cast<size_t>(assets_->codec.frame_length);
+        if (result.audio.samples.size() > samples) result.audio.samples.resize(samples);
     } else if (!streaming) {
         result.audio = codec_->decode_codes(result.codes);
         codec_->release_runtime_graphs();

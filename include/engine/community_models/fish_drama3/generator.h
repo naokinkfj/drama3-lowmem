@@ -13,12 +13,16 @@ struct Drama3Sampling {
     int top_k = 30;
     int64_t max_frames = 1024;
     uint32_t seed = 0;
+    // drama3-lowmem: stop a take whose main token repeats this many frames in
+    // a row (a stuck silence); 0 disables the check.
+    int64_t stall_frames = 0;
 };
 
 struct Drama3Generation {
     codecs::FishDacCodes codes;
     runtime::AudioBuffer audio;
     bool reached_limit = false;
+    bool stalled = false;
 };
 
 class Drama3Generator {

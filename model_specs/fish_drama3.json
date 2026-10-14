@@ -129,6 +129,29 @@
         "description": "Reproducible native sampling seed.",
         "required": false,
         "min": 0
+      },
+      {
+        "name": "stall_frames",
+        "type": "int",
+        "description": "drama3-lowmem: stop a take whose main token repeats this many frames in a row (a stuck silence, about 2.9 s at 64); 0 disables.",
+        "required": false,
+        "min": 0,
+        "default": 64
+      },
+      {
+        "name": "stall_retries",
+        "type": "int",
+        "description": "drama3-lowmem: offline only, regenerate a stalled chunk up to this many times with another seed.",
+        "required": false,
+        "min": 0,
+        "default": 2
+      },
+      {
+        "name": "split_speaker_turns",
+        "type": "bool",
+        "description": "drama3-lowmem: generate each <|speaker:N|> turn as its own chunk, continuing from the previous one. On by default: in a 8-seed test two-speaker dialogues finished completely 8/8 with it and 4/8 without.",
+        "required": false,
+        "default": true
       }
     ],
     "session": [
@@ -247,7 +270,9 @@
       "format": "gguf",
       "precision": "q4_k",
       "target_directory": "Drama-3-GGUF",
-      "files": ["drama-3-backbone-8bit-experts-Q4_K_S.gguf"]
+      "files": [
+        "drama-3-backbone-8bit-experts-Q4_K_S.gguf"
+      ]
     },
     {
       "id": "fish_drama3_q3_experts_q8_backbone",
@@ -256,7 +281,9 @@
       "format": "gguf",
       "precision": "q3_k",
       "target_directory": "Drama-3-GGUF",
-      "files": ["drama-3-backbone-8bit-experts-Q3_K_S.gguf"]
+      "files": [
+        "drama-3-backbone-8bit-experts-Q3_K_S.gguf"
+      ]
     },
     {
       "id": "fish_drama3_q2_experts_q8_backbone",
@@ -265,7 +292,9 @@
       "format": "gguf",
       "precision": "q2_k",
       "target_directory": "Drama-3-GGUF",
-      "files": ["drama-3-backbone-8bit-experts-Q2_K.gguf"]
+      "files": [
+        "drama-3-backbone-8bit-experts-Q2_K.gguf"
+      ]
     },
     {
       "id": "fish_drama3_q4_backbone",
@@ -274,7 +303,9 @@
       "format": "gguf",
       "precision": "q4_k",
       "target_directory": "Drama-3-GGUF",
-      "files": ["drama-3-backbone-4bit-experts-Q4_K_S.gguf"]
+      "files": [
+        "drama-3-backbone-4bit-experts-Q4_K_S.gguf"
+      ]
     }
   ],
   "sources": [
