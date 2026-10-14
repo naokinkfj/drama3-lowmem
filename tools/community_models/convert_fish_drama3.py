@@ -33,11 +33,15 @@ parser.add_argument("--output", type=Path, help="Intermediate FP16 GGUF (about 6
 parser.add_argument("--input-gguf", type=Path, help="Reuse a prepared FP16 GGUF instead of exporting again")
 parser.add_argument("--quantized-output", type=Path, help="Standalone mixed-quantization GGUF")
 parser.add_argument("--gguf-tool", type=Path, help="Path to the native audiocpp_gguf executable")
-parser.add_argument("--expert-type", choices=("q2_k", "q3_k", "q4_k", "q5_k", "q6_k", "q8_0"), default="q4_k")
-parser.add_argument("--backbone-type", choices=("q2_k", "q3_k", "q4_k", "q5_k", "q6_k", "q8_0"), default="q8_0",
+# "orig" keeps the intermediate archive's storage type, so a package built with
+# --expert-type orig --backbone-type orig --embedding-type orig is unquantized.
+parser.add_argument("--expert-type", choices=("orig", "q2_k", "q3_k", "q4_k", "q5_k", "q6_k", "q8_0"), default="q4_k")
+parser.add_argument("--backbone-type", choices=("orig", "q2_k", "q3_k", "q4_k", "q5_k", "q6_k", "q8_0"), default="q8_0",
                     help="Dense backbone matrix quantization; audio tower and codec retain their preparation types")
-parser.add_argument("--embedding-type", choices=("f16", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0"), default="q8_0",
+parser.add_argument("--embedding-type", choices=("orig", "f16", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0"), default="q8_0",
                     help="Main text embedding storage; defaults to Q8_0 and exposes CUDA-supported row lookup types")
+parser.add_argument("--expert-float", choices=("f16", "bf16"), default="f16",
+                    help="Intermediate storage for the scaled FP8 experts after applying their block scales")
 parser.add_argument("--threads", type=int, default=8)
 arguments = parser.parse_args()
 if arguments.threads <= 0:
@@ -102,12 +106,35 @@ for shard_name in dict.fromkeys(weight_map.values()):
         headers.update(json.loads(shard_file.read(header_length)))
 
 
-def load_tensor(tensor_name):
+STORAGE_TORCH = {"f32": torch.float32, "f16": torch.float16, "bf16": torch.bfloat16}
+# numpy has no bfloat16; BF16 tensors are written as raw 16-bit words.
+STORAGE_NUMPY = {"f32": np.float32, "f16": np.float16, "bf16": np.uint16}
+STORAGE_RAW = {"f32": None, "f16": None, "bf16": gguf.GGMLQuantizationType.BF16}
+
+
+def storage_type(shape, source_dtype):
+    """Keep every source tensor at its own precision: F32 and 1-D stay F32, BF16 stays BF16."""
+    if len(shape) <= 1 or source_dtype == "F32":
+        return "f32"
+    if source_dtype == "BF16":
+        return "bf16"
+    if source_dtype == "F8_E4M3":
+        return arguments.expert_float
+    return "f16"
+
+
+def load_tensor(tensor_name, storage):
     tensor = shards[weight_map[tensor_name]].get_tensor(tensor_name)
     if tensor.dtype == torch.float8_e4m3fn:
         scale = shards[weight_map[tensor_name + "_scale_inv"]].get_tensor(tensor_name + "_scale_inv")
         tensor = tensor.float() * scale.repeat_interleave(128, 0).repeat_interleave(128, 1)[:tensor.shape[0], :tensor.shape[1]]
-    return tensor.to(torch.float32 if tensor.ndim <= 1 or tensor.dtype == torch.float32 else torch.float16).numpy()
+    return tensor.to(STORAGE_TORCH[storage])
+
+
+def to_numpy(tensor, storage):
+    if storage == "bf16":
+        return tensor.contiguous().view(torch.int16).numpy().view(np.uint16)
+    return tensor.contiguous().numpy()
 
 
 tensor_plan = []
@@ -116,13 +143,12 @@ for tensor_name in weight_map:
         continue
     tensor_header = headers[tensor_name]
     tensor_shape = tensor_header["shape"]
-    tensor_dtype = np.float32 if len(tensor_shape) <= 1 or tensor_header["dtype"] == "F32" else np.float16
-    tensor_plan.append(("model_weights/" + tensor_name, tensor_shape, tensor_dtype, tensor_name))
+    tensor_plan.append(("model_weights/" + tensor_name, tensor_shape, storage_type(tensor_shape, tensor_header["dtype"]), tensor_name))
 for layer_index in range(layer_count):
     for projection_name in ("gate_proj", "up_proj", "down_proj"):
         matrix_shape = (expert_width, hidden_width) if projection_name != "down_proj" else (hidden_width, expert_width)
         tensor_name = f"model.language_model.layers.{layer_index}.mlp.experts.{projection_name}.weight"
-        tensor_plan.append(("model_weights/" + tensor_name, (expert_count, *matrix_shape), np.float16, (layer_index, projection_name)))
+        tensor_plan.append(("model_weights/" + tensor_name, (expert_count, *matrix_shape), arguments.expert_float, (layer_index, projection_name)))
 
 codec = torch.load(arguments.checkpoint / "codec.pth", map_location="cpu", weights_only=True)
 codec = codec.get("state_dict", codec)
@@ -137,9 +163,9 @@ for tensor_name, tensor in codec.items():
         tensor_name = tensor_name.removesuffix("weight_v") + "weight"
     if not isinstance(tensor, torch.Tensor):
         continue
-    tensor = tensor.to(torch.float32 if tensor.ndim <= 1 else torch.float16).contiguous()
-    folded_codec[tensor_name] = tensor.numpy()
-    tensor_plan.append(("codec_weights/" + tensor_name, tuple(tensor.shape), folded_codec[tensor_name].dtype, None))
+    storage = "f32" if tensor.ndim <= 1 else "f16"
+    folded_codec[tensor_name] = tensor.to(STORAGE_TORCH[storage]).contiguous()
+    tensor_plan.append(("codec_weights/" + tensor_name, tuple(tensor.shape), storage, None))
 
 arguments.output.parent.mkdir(parents=True, exist_ok=True)
 writer = gguf.GGUFWriter(arguments.output, "fish_drama3")
@@ -149,25 +175,27 @@ writer.add_string("audiocpp.source_model", "fishaudio/drama-3")
 writer.add_array("audiocpp.tensor_names", [tensor_name for tensor_name, _, _, _ in tensor_plan])
 writer.add_key_value("audiocpp.tensor_ranks", [len(shape) for _, shape, _, _ in tensor_plan], gguf.GGUFValueType.ARRAY, gguf.GGUFValueType.INT32)
 writer.add_key_value("audiocpp.tensor_shapes", [dimension for _, shape, _, _ in tensor_plan for dimension in shape], gguf.GGUFValueType.ARRAY, gguf.GGUFValueType.INT64)
-for tensor_index, (tensor_name, tensor_shape, tensor_dtype, _) in enumerate(tensor_plan):
-    writer.add_tensor_info(f"_audiocpp.{tensor_index}", tensor_shape, np.dtype(tensor_dtype), math.prod(tensor_shape) * np.dtype(tensor_dtype).itemsize)
+for tensor_index, (tensor_name, tensor_shape, storage, _) in enumerate(tensor_plan):
+    tensor_dtype = np.dtype(STORAGE_NUMPY[storage])
+    writer.add_tensor_info(f"_audiocpp.{tensor_index}", tensor_shape, tensor_dtype, math.prod(tensor_shape) * tensor_dtype.itemsize,
+                           raw_dtype=STORAGE_RAW[storage])
 writer.write_header_to_file()
 writer.write_kv_data_to_file()
 writer.write_ti_data_to_file()
-for tensor_index, (tensor_name, tensor_shape, tensor_dtype, source_name) in enumerate(tensor_plan):
+for tensor_index, (tensor_name, tensor_shape, storage, source_name) in enumerate(tensor_plan):
     if tensor_name.startswith("codec_weights/"):
         tensor_values = folded_codec[tensor_name.removeprefix("codec_weights/")]
     elif isinstance(source_name, tuple):
         layer_index, projection_name = source_name
-        tensor_values = np.empty(tensor_shape, dtype=tensor_dtype)
+        tensor_values = torch.empty(tensor_shape, dtype=STORAGE_TORCH[storage])
         for expert_index in range(expert_count):
             source_tensor_name = f"model.language_model.layers.{layer_index}.mlp.experts.{expert_index}.{projection_name}.weight"
-            tensor_values[expert_index] = load_tensor(source_tensor_name)
+            tensor_values[expert_index] = load_tensor(source_tensor_name, storage)
     else:
-        tensor_values = load_tensor(source_name)
-    if not np.isfinite(tensor_values).all():
+        tensor_values = load_tensor(source_name, storage)
+    if not torch.isfinite(tensor_values).all():
         raise RuntimeError(f"Non-finite values in {tensor_name}")
-    writer.write_tensor_data(tensor_values)
+    writer.write_tensor_data(to_numpy(tensor_values, storage))
     if tensor_index % 20 == 0 or isinstance(source_name, tuple):
         print(f"{tensor_index + 1}/{len(tensor_plan)} {tensor_name}", flush=True)
 writer.close()
