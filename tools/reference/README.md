@@ -99,12 +99,13 @@ The tower keeps its float32 weights (about 4 GiB) because it runs once per frame
   recurrent one. Both are exact forms of the same recurrence; they agree to about 1e-6
   in float32 and 1e-15 in float64.
 - Top-8 routing uses `torch.topk` on the softmax probabilities, renormalized
-  (`norm_topk_prob`). Real inputs do produce near-ties: in `en_short` (178 rows) the
-  gap between the 8th and 9th expert probability is below 4e-9 at four (row, layer)
-  pairs, in float64 as well. Two implementations can break such a tie differently, and
+  (`norm_topk_prob`). Real inputs do produce near-ties: in `en_short` (178 rows)
+  `log(p8 / p9)` is below 5e-7, a few float32 ulps, at three (row, layer) pairs where the
+  8th expert carries 7-12% of the routing weight; float64 confirms the ties. Two implementations can break such a tie differently, and
   the difference then carries to every later row through attention and the delta-rule
-  state. `ref_meta.json` lists the smallest gaps (`router_near_ties`) so that a spike in
-  a comparison can be traced to one. The reference's float32 and float64 runs pick the
+  state. `ref_meta.json` lists the smallest logit gaps among
+  tokens whose 8th expert carries at least 1e-3 of the weight (`router_near_ties`), so
+  that a spike in a comparison can be traced to one. The reference's float32 and float64 runs pick the
   same experts everywhere in `en_short`.
 
 ## Validation record (Ryzen 9 9950X3D, torch 2.14 CPU)
@@ -115,7 +116,7 @@ The tower keeps its float32 weights (about 4 GiB) because it runs once per frame
 | `check_hf_backbone.py`, 4 layers, 120 rows of `en_short` | vs transformers 5.19 rel-L2 2.3e-7, max abs 3.8e-6 |
 | `check-steps`, 24 rows of `en_short` | hidden rel-L2 4.0e-7; tower logits rel-L2 5.5e-7 |
 | `check-steps`, 64 rows of `smoke_ref` (with a voice reference) | hidden rel-L2 6.1e-7; tower logits rel-L2 1.1e-6 |
-| `check-steps`, 150 rows of `en_short` | identical to 7e-7 up to row 108; at row 109 layer 20 the 8th/9th router gap is 8e-10 (float64), the stepwise path picks the other expert, and rows after that differ by 0.4-9% |
+| `check-steps`, 150 rows of `en_short` | identical to 7e-7 up to row 108; at row 109 layer 20 `log(p8/p9)` is 4e-7 with the 8th expert at 12% weight, the stepwise path picks the other expert, and rows after that differ by 0.4-9% |
 | `run --dtype float64` vs float32, `en_short` | hidden rel-L2 5.3e-7 (worst row 2e-6); semantic 3.2e-7, residual 5.2e-7; argmax identical |
 | `run` after the cleanup pass | outputs bit-identical to the run before it |
 | `make_case.py` | detokenized rows reproduce the `reference-bracket-v1` template; text rows carry zero codes; reference rows are `[semantic_begin + c0, c0..c9]` |

@@ -371,28 +371,32 @@ class Backbone:
             raise NotImplementedError("the backbone uses NeoX rotary")
         if decoder.get("vq_feature_placement") != "backbone_partial":
             raise NotImplementedError("only vq_feature_placement=backbone_partial")
-        # (layer, p[k-1] - p[k] per row) of every MoE call: how close each token came
-        # to swapping its k-th expert for the next one. See near_ties().
+        # (layer, top k+1 router probabilities per row) of every MoE call: how close
+        # each token came to swapping its k-th expert for the next one. See near_ties().
         self.router_margins: list[tuple[int, torch.Tensor]] = []
 
     def weight(self, name: str) -> torch.Tensor:
         return self.checkpoint.get(self.PREFIX + name, self.dtype)
 
-    def near_ties(self, count: int = 10) -> list[dict]:
-        """The smallest top-k router margins logged since router_margins was cleared.
+    def near_ties(self, count: int = 10, min_weight: float = 1e-3) -> list[dict]:
+        """The closest top-k router decisions logged since router_margins was cleared.
 
-        A margin below the working precision means the k-th and (k+1)-th experts are
-        tied: any implementation may pick either, and the difference then propagates
-        to every later row. Assumes one forward over rows 0.. (the full forward).
+        logit_gap = log(p_k / p_k+1): near zero, the k-th and (k+1)-th experts are
+        tied and any implementation may pick either. weight = the k-th expert's
+        renormalized routing weight, i.e. how much a swap matters; ties below
+        min_weight are skipped. A swap that matters propagates to every later row.
+        Assumes one forward over rows 0.. (the full forward).
         """
-        entries = [
-            (float(margin), row, layer)
-            for layer, margins in self.router_margins
-            for row, margin in enumerate(margins.tolist())
-        ]
+        entries = []
+        for layer, top_probs in self.router_margins:
+            logit_gap = (top_probs[:, -2] / top_probs[:, -1]).log()
+            weight = top_probs[:, -2] / top_probs[:, :-1].sum(dim=-1)
+            for row, (gap, w) in enumerate(zip(logit_gap.tolist(), weight.tolist())):
+                if w >= min_weight:
+                    entries.append((gap, row, layer, w))
         return [
-            {"row": row, "layer": layer, "margin": margin}
-            for margin, row, layer in sorted(entries)[:count]
+            {"row": row, "layer": layer, "logit_gap": gap, "weight": w}
+            for gap, row, layer, w in sorted(entries)[:count]
         ]
 
     # -- inputs -------------------------------------------------------------------------
@@ -523,7 +527,7 @@ class Backbone:
         p = f"layers.{i}.mlp."
         router_probs = torch.softmax(x @ self.weight(p + "gate.weight").T, dim=-1)
         top_probs, top_experts = router_probs.topk(self.experts_per_token + 1, dim=-1)
-        self.router_margins.append((i, top_probs[:, -2] - top_probs[:, -1]))
+        self.router_margins.append((i, top_probs))
         top_probs, top_experts = top_probs[:, :-1], top_experts[:, :-1]
         if self.normalize_top_k:
             top_probs = top_probs / top_probs.sum(dim=-1, keepdim=True)
@@ -926,10 +930,10 @@ def command_run(args: argparse.Namespace) -> None:
             "Backbone: one causal forward over prompt rows + frames, chunked gated "
             "delta rule (chunk 64).",
             "Rotary angles are formed in float64 and cast to the compute dtype.",
-            "router_near_ties: smallest gaps between the 8th and 9th router "
-            "probabilities. A gap near the working precision is a tie any "
-            "implementation may break either way; differences from that row on "
-            "are then expected.",
+            "router_near_ties: smallest log(p8 / p9) router gaps among tokens whose "
+            "8th expert carries >= 1e-3 of the routing weight. A gap near the "
+            "working precision is a tie any implementation may break either way; "
+            "differences from that row on are then expected.",
             "Tower: prefill over prompt rows 0..P-2 (label = next row), then one step "
             "per frame at row P-1+t with label frames[t]; equivalent to the official "
             "prefill whose last row gets a placeholder label that the same "
