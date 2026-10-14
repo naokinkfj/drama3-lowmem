@@ -346,13 +346,17 @@ Drama3Generation Drama3Generator::generate(const std::string & text, const std::
         split(tower_ms);
         repeat_run = !output_frames.empty() && output_frames.size() > 1 && output_frames[output_frames.size() - 2][0] == next[0]
             ? repeat_run + 1 : 1;
+        if (background_codec) background_codec->push(next);
         if (sampling.stall_frames > 0 && repeat_run >= sampling.stall_frames && teacher.empty()) {
-            // Keep a short pause of the repeated frame and drop the rest.
-            output_frames.resize(output_frames.size() - static_cast<size_t>(repeat_run) + std::min<size_t>(repeat_run, 8));
+            // Offline: keep a short pause of the repeated frame and drop the
+            // rest (its audio is trimmed to match below). Streamed frames have
+            // already been delivered, so the codes keep them too.
+            if (!streaming) {
+                output_frames.resize(output_frames.size() - static_cast<size_t>(repeat_run) + std::min<size_t>(repeat_run, 8));
+            }
             result.stalled = true;
             break;
         }
-        if (background_codec) background_codec->push(next);
         if (step == 0) mark_phase("tower_first_frame_ms");
         recent.push_back(next[0]);
         if (recent.size() > 16) recent.pop_front();
@@ -387,6 +391,12 @@ Drama3Generation Drama3Generator::generate(const std::string & text, const std::
                   << " codec_ms=" << codec_ms / frames << " (per frame)\n";
     }
     if (dumping) {
+        // A stall cut frames after their rows were recorded.
+        const auto rows = output_frames.size();
+        dump_hidden.resize(std::min(dump_hidden.size(), rows * static_cast<size_t>(assets_->backbone.hidden_size)));
+        dump_semantic.resize(std::min(dump_semantic.size(), rows * static_cast<size_t>(assets_->tower.codebook_size + 1)));
+        dump_residual.resize(std::min(dump_residual.size(),
+            rows * static_cast<size_t>(assets_->tower.residual_layers * assets_->tower.codebook_size)));
         // Teacher-forced numerical dump for tools/reference: per step hidden,
         // semantic candidates [eos, codes...] and residual codebook logits, plus
         // one prefill over prompt + all frames to check prefill against decode.

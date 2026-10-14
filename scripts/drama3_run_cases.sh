@@ -58,6 +58,7 @@ docker run --rm --gpus all --user "$(id -u):$(id -g)" -e HOME=/tmp ${env_args[@]
     --request-sequence "$output/requests.json" --out-dir "$output" --metrics "$@" > "$output/run.log" 2>&1 || {
         echo "audiocpp_cli failed; see $output/run.log" >&2
         tail -n 5 "$output/run.log" >&2
+        failed=1
     }
 
 {
@@ -66,3 +67,4 @@ docker run --rm --gpus all --user "$(id -u):$(id -g)" -e HOME=/tmp ${env_args[@]
     echo "min host available MiB: $(cut -d, -f3 "$output/host-memory.csv" | sort -n | head -1)"
     echo "max swap used MiB: $(cut -d, -f4 "$output/host-memory.csv" | sort -n | tail -1)"
 } | tee "$output/summary.txt"
+exit "${failed:-0}"
