@@ -43,7 +43,10 @@ gpu_sampler=$!
 host_sampler=$!
 trap 'kill $gpu_sampler $host_sampler 2>/dev/null || true' EXIT
 
-docker run --rm --gpus all --user "$(id -u):$(id -g)" -e HOME=/tmp \
+# Pass ggml CUDA tuning variables (e.g. GGML_CUDA_FORCE_CUBLAS_COMPUTE_32F) through to the container.
+env_args=()
+for name in $(compgen -e | grep '^GGML_' || true); do env_args+=(-e "$name"); done
+docker run --rm --gpus all --user "$(id -u):$(id -g)" -e HOME=/tmp ${env_args[@]+"${env_args[@]}"} \
     -v "$source_dir":"$source_dir" -v "$(dirname "$model")":"$(dirname "$model")" -v "$output":"$output" \
     drama3-lowmem-dev \
     "$source_dir/build/linux-cuda-release/bin/audiocpp_cli" \

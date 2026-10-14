@@ -38,6 +38,12 @@ private:
     int64_t cache_steps_;
     bool profile_first_audio_ = false;
     bool offline_codec_stream_ = true;
+    bool profile_steps_ = false;
+    // drama3-lowmem numerical validation: when set, generate() writes every
+    // step's backbone hidden state and raw logits to this directory, and
+    // teacher_frames_path_ (optional) forces the generated frames.
+    std::string teacher_dump_dir_;
+    std::string teacher_frames_path_;
     std::unique_ptr<Drama3BackboneDecoderRuntime> backbone_;
     std::unique_ptr<Drama3Tower> tower_;
     std::unique_ptr<core::ExecutionContext> codec_execution_;

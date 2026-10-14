@@ -195,6 +195,25 @@
           "full"
         ],
         "default": "stream"
+      },
+      {
+        "name": "profile_steps",
+        "type": "bool",
+        "description": "Print the average per-frame time of backbone, lm_head, sampling, tower and codec to stderr.",
+        "required": false,
+        "default": false
+      },
+      {
+        "name": "teacher_dump",
+        "type": "string",
+        "description": "Validation only: directory that receives per-step hidden states and raw logits (see tools/reference).",
+        "required": false
+      },
+      {
+        "name": "teacher_frames",
+        "type": "string",
+        "description": "Validation only: JSON file of frames to force instead of sampling (use with teacher_dump).",
+        "required": false
       }
     ],
     "load": []

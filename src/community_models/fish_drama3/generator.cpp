@@ -1,13 +1,17 @@
 #include "engine/community_models/fish_drama3/generator.h"
 
 #include "engine/framework/debug/profiler.h"
+#include "engine/framework/io/json.h"
 #include "engine/framework/runtime/options.h"
 
 #include <algorithm>
 #include <cmath>
 #include <chrono>
 #include <deque>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <sstream>
 #include <numeric>
 #include <random>
 #include <stdexcept>
@@ -39,6 +43,39 @@ int32_t sample(const std::vector<float> & logits, float temperature, int top_k,
     return order[choice(random)];
 }
 
+void write_f32(const std::filesystem::path & path, const std::vector<float> & values) {
+    std::ofstream out(path, std::ios::binary);
+    out.write(reinterpret_cast<const char *>(values.data()), static_cast<std::streamsize>(values.size() * sizeof(float)));
+    if (!out) throw std::runtime_error("failed to write " + path.string());
+}
+
+std::string frames_json(const std::vector<Drama3Frame> & frames) {
+    std::ostringstream out;
+    out << '[';
+    for (size_t row = 0; row < frames.size(); ++row) {
+        out << (row ? ",[" : "[");
+        for (size_t i = 0; i < frames[row].size(); ++i) out << (i ? "," : "") << frames[row][i];
+        out << ']';
+    }
+    out << ']';
+    return out.str();
+}
+
+std::vector<Drama3Frame> read_frames(const std::filesystem::path & path) {
+    const auto root = io::json::parse_file(path);
+    const auto * frames = root.is_array() ? &root : root.find("frames");
+    if (frames == nullptr) throw std::runtime_error("teacher frames json needs a frames array: " + path.string());
+    std::vector<Drama3Frame> out;
+    for (const auto & row : frames->as_array()) {
+        const auto & values = row.as_array();
+        if (values.size() != 11) throw std::runtime_error("teacher frames need 11 values per row");
+        Drama3Frame frame{};
+        for (size_t i = 0; i < values.size(); ++i) frame[i] = static_cast<int32_t>(values[i].as_i64());
+        out.push_back(frame);
+    }
+    return out;
+}
+
 std::vector<float> last_hidden(const std::vector<float> & values, int64_t width) {
     if (values.size() < static_cast<size_t>(width)) throw std::runtime_error("Drama 3 backbone returned too few hidden values");
     return {values.end() - width, values.end()};
@@ -57,6 +94,11 @@ Drama3Generator::Drama3Generator(std::shared_ptr<const Drama3Assets> assets,
     auto backbone_config = assets_->backbone;
     backbone_config.decode_cache_steps = cache_steps_;
     backbone_config.cpu_expert_layers = runtime::parse_i64_option(options.options, {"fish_drama3.cpu_expert_layers"}).value_or(4);
+    if (const auto value = runtime::find_option(options.options, {"fish_drama3.profile_steps"})) {
+        profile_steps_ = runtime::parse_bool_option(*value, "fish_drama3.profile_steps");
+    }
+    if (const auto value = runtime::find_option(options.options, {"fish_drama3.teacher_dump"})) teacher_dump_dir_ = *value;
+    if (const auto value = runtime::find_option(options.options, {"fish_drama3.teacher_frames"})) teacher_frames_path_ = *value;
     if (const auto value = runtime::find_option(options.options, {"fish_drama3.offline_codec"})) {
         if (*value == "full") offline_codec_stream_ = false;
         else if (*value != "stream") throw std::runtime_error("fish_drama3.offline_codec requires stream or full");
@@ -164,20 +206,41 @@ Drama3Generation Drama3Generator::generate(const std::string & text, const std::
     auto hidden = last_hidden(prefill.hidden, assets_->backbone.hidden_size);
     Drama3Frame current = prompt.back();
     std::mt19937 random(sampling.seed);
+    const bool dumping = !teacher_dump_dir_.empty();
+    const auto teacher = teacher_frames_path_.empty() ? std::vector<Drama3Frame>{} : read_frames(teacher_frames_path_);
+    std::vector<float> dump_hidden, dump_semantic, dump_residual;
     std::deque<int32_t> recent;
     std::vector<Drama3Frame> output_frames;
     Drama3Generation result;
     if (streaming) codec_->reset_decode_stream();
+    // Per-frame time split for tuning (fish_drama3.profile_steps).
+    double lm_head_ms = 0, sample_ms = 0, tower_ms = 0, codec_ms = 0, backbone_ms = 0;
+    auto lap = ProfileClock::now();
+    const auto split = [&](double & bucket) {
+        if (!profile_steps_) return;
+        const auto now = ProfileClock::now();
+        bucket += std::chrono::duration<double, std::milli>(now - lap).count();
+        lap = now;
+    };
     for (int64_t step = 0; step < sampling.max_frames; ++step) {
+        if (!teacher.empty() && step >= static_cast<int64_t>(teacher.size())) break;
+        split(backbone_ms);
         const auto logits = backbone_->lm_head(hidden);
+        split(lm_head_ms);
         std::vector<float> candidates(static_cast<size_t>(assets_->tower.codebook_size + 1));
         candidates[0] = logits.at(assets_->eos);
         std::copy_n(logits.begin() + assets_->tower.semantic_begin, assets_->tower.codebook_size, candidates.begin() + 1);
+        if (dumping) {
+            dump_hidden.insert(dump_hidden.end(), hidden.begin(), hidden.end());
+            dump_semantic.insert(dump_semantic.end(), candidates.begin(), candidates.end());
+        }
         const int32_t first = sample(candidates, sampling.temperature, sampling.top_k, sampling.top_p, random);
         const int32_t second = sample(candidates, 1.0F, 30, 0.95F, random);
         const int32_t first_token = first == 0 ? assets_->eos : assets_->tower.semantic_begin + first - 1;
         const bool repeats = first != 0 && std::find(recent.begin(), recent.end(), first_token) != recent.end();
-        const int32_t selected = repeats ? second : first;
+        int32_t selected = repeats ? second : first;
+        if (!teacher.empty()) selected = teacher[static_cast<size_t>(step)][0] - assets_->tower.semantic_begin + 1;
+        split(sample_ms);
         if (selected == 0) break;
         if (step == 0) mark_phase("semantic_ms");
         Drama3Frame next{};
@@ -194,9 +257,12 @@ Drama3Generation Drama3Generator::generate(const std::string & text, const std::
             tower_hidden = tower_output.hidden;
             if (layer >= config.shared_layers) {
                 next[2 + book] = sample(tower_output.logits, sampling.temperature, sampling.top_k, sampling.top_p, random);
+                if (!teacher.empty()) next[2 + book] = teacher[static_cast<size_t>(step)][2 + book];
+                if (dumping) dump_residual.insert(dump_residual.end(), tower_output.logits.begin(), tower_output.logits.end());
             }
         }
         output_frames.push_back(next);
+        split(tower_ms);
         if (step == 0) mark_phase("tower_first_frame_ms");
         recent.push_back(next[0]);
         if (recent.size() > 16) recent.pop_front();
@@ -215,6 +281,7 @@ Drama3Generation Drama3Generator::generate(const std::string & text, const std::
                 std::cerr << " total_ms=" << std::chrono::duration<double, std::milli>(ProfileClock::now() - profile_start).count() << '\n';
             }
         }
+        split(codec_ms);
         if (step + 1 == sampling.max_frames) { result.reached_limit = true; break; }
         current = next;
         auto embedding = backbone_->token_embedding({current[0]});
@@ -222,12 +289,48 @@ Drama3Generation Drama3Generator::generate(const std::string & text, const std::
         hidden = decoder->run_embedding_step(embedding);
     }
     if (output_frames.empty()) throw std::runtime_error("Drama 3 ended before producing an audio frame");
+    if (profile_steps_) {
+        const double frames = static_cast<double>(output_frames.size());
+        std::cerr << "[drama3.profile_steps] frames=" << output_frames.size()
+                  << " backbone_ms=" << backbone_ms / frames << " lm_head_ms=" << lm_head_ms / frames
+                  << " sample_ms=" << sample_ms / frames << " tower_ms=" << tower_ms / frames
+                  << " codec_ms=" << codec_ms / frames << " (per frame)\n";
+    }
+    if (dumping) {
+        // Teacher-forced numerical dump for tools/reference: per step hidden,
+        // semantic candidates [eos, codes...] and residual codebook logits, plus
+        // one prefill over prompt + all frames to check prefill against decode.
+        const std::filesystem::path dir(teacher_dump_dir_);
+        std::filesystem::create_directories(dir);
+        write_f32(dir / "hidden_decode.f32", dump_hidden);
+        write_f32(dir / "semantic.f32", dump_semantic);
+        write_f32(dir / "residual.f32", dump_residual);
+        std::vector<Drama3Frame> all_rows = prompt;
+        all_rows.insert(all_rows.end(), output_frames.begin(), output_frames.end());
+        std::vector<int32_t> all_ids;
+        for (const auto & frame : all_rows) all_ids.push_back(frame[0]);
+        auto all_embeddings = backbone_->token_embedding(all_ids);
+        tower_->mix_backbone_embeddings(all_embeddings, all_rows);
+        auto check = backbone_->create_decode_session(cache_steps_);
+        check->reset();
+        write_f32(dir / "hidden_prefill.f32", check->prefill_embeddings(all_embeddings, static_cast<int64_t>(all_rows.size())).hidden);
+        std::ofstream meta(dir / "meta.json");
+        meta << "{\"hidden_size\": " << assets_->backbone.hidden_size
+             << ", \"codebook_size\": " << assets_->tower.codebook_size
+             << ", \"num_codebooks\": 10, \"eos\": " << assets_->eos
+             << ", \"semantic_begin\": " << assets_->tower.semantic_begin
+             << ", \"shared_layers\": " << assets_->tower.shared_layers
+             << ", \"residual_layers\": " << assets_->tower.residual_layers
+             << ", \"prompt_rows\": " << frames_json(prompt)
+             << ", \"frames\": " << frames_json(output_frames) << "}\n";
+    }
     result.codes.codebooks = 10;
     result.codes.frames = static_cast<int64_t>(output_frames.size());
     result.codes.codes.resize(output_frames.size() * 10);
     for (int64_t book = 0; book < 10; ++book) {
         for (size_t row = 0; row < output_frames.size(); ++row) result.codes.codes[book * output_frames.size() + row] = output_frames[row][book + 1];
     }
+    const auto codec_started = ProfileClock::now();
     if (!streaming && offline_codec_stream_) {
         // drama3-lowmem: decode through the causal streaming graph one frame at
         // a time. Its memory does not grow with the take, whereas the
@@ -244,6 +347,11 @@ Drama3Generation Drama3Generator::generate(const std::string & text, const std::
     } else if (!streaming) {
         result.audio = codec_->decode_codes(result.codes);
         codec_->release_runtime_graphs();
+    }
+    if (profile_steps_ && !streaming) {
+        std::cerr << "[drama3.profile_steps] offline_codec_ms_per_frame="
+                  << std::chrono::duration<double, std::milli>(ProfileClock::now() - codec_started).count() /
+                         static_cast<double>(output_frames.size()) << '\n';
     }
     if (result.reached_limit) std::cerr << "[fish_drama3] max_tokens reached; audio may be incomplete\n";
     return result;
