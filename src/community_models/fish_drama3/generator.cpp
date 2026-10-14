@@ -225,11 +225,9 @@ Drama3Generation Drama3Generator::generate(const std::string & text, const std::
     for (int64_t step = 0; step < sampling.max_frames; ++step) {
         if (!teacher.empty() && step >= static_cast<int64_t>(teacher.size())) break;
         split(backbone_ms);
-        const auto logits = backbone_->lm_head(hidden);
+        const auto candidates = backbone_->candidate_logits(
+            hidden, assets_->eos, assets_->tower.semantic_begin, static_cast<int32_t>(assets_->tower.codebook_size));
         split(lm_head_ms);
-        std::vector<float> candidates(static_cast<size_t>(assets_->tower.codebook_size + 1));
-        candidates[0] = logits.at(assets_->eos);
-        std::copy_n(logits.begin() + assets_->tower.semantic_begin, assets_->tower.codebook_size, candidates.begin() + 1);
         if (dumping) {
             dump_hidden.insert(dump_hidden.end(), hidden.begin(), hidden.end());
             dump_semantic.insert(dump_semantic.end(), candidates.begin(), candidates.end());

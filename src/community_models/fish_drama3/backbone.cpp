@@ -1074,10 +1074,17 @@ public:
         mem_.reset(execution_.backend());
     }
 
-    std::vector<float> run(const std::vector<float> & hidden) {
+    // Only the rows the sampler can pick are computed: eos followed by `count`
+    // consecutive semantic tokens. The full vocabulary is ~250k rows, so this
+    // skips almost all of the LM head's weight reads.
+    std::vector<float> run(const std::vector<float> & hidden, int32_t eos, int32_t first, int32_t count) {
         if (static_cast<int64_t>(hidden.size()) != config_.hidden_size) {
             throw std::runtime_error("Drama 3 backbone LM head hidden size mismatch");
         }
+        if (mem_.graph != nullptr && (eos != eos_ || first != first_ || count != count_)) release_graph();
+        eos_ = eos;
+        first_ = first;
+        count_ = count;
         ensure();
         core::write_tensor_f32(core::wrap_tensor(input_, core::TensorShape::from_dims({1, 1, config_.hidden_size})), hidden);
         if (core::compute_backend_graph(execution_.backend(), mem_.graph, nullptr, "drama3_backbone.lm_head") != GGML_STATUS_SUCCESS) {
@@ -1106,8 +1113,14 @@ private:
         auto x = core::make_tensor(input_ctx, GGML_TYPE_F32, core::TensorShape::from_dims({1, 1, config_.hidden_size}));
         input_ = x.tensor;
         ggml_set_input(input_);
-        x = modules::LinearModule({config_.hidden_size, config_.vocab_size, false}).build(ctx, x, weights_->lm_head);
-        output_ = core::ensure_backend_addressable_layout(ctx, x).tensor;
+        ggml_tensor * weight = weights_->lm_head.weight.tensor;
+        if (eos_ < 0 || first_ < 0 || count_ <= 0 || first_ + count_ > weight->ne[1] || eos_ >= weight->ne[1]) {
+            throw std::runtime_error("Drama 3 LM head candidate rows are out of range");
+        }
+        ggml_tensor * eos_row = ggml_view_2d(ctx.ggml, weight, weight->ne[0], 1, weight->nb[1], static_cast<size_t>(eos_) * weight->nb[1]);
+        ggml_tensor * code_rows = ggml_view_2d(ctx.ggml, weight, weight->ne[0], count_, weight->nb[1], static_cast<size_t>(first_) * weight->nb[1]);
+        ggml_tensor * column = ggml_reshape_2d(ctx.ggml, x.tensor, config_.hidden_size, 1);
+        output_ = ggml_concat(ctx.ggml, ggml_mul_mat(ctx.ggml, eos_row, column), ggml_mul_mat(ctx.ggml, code_rows, column), 0);
         ggml_set_output(output_);
         mem_.graph = ggml_new_graph_custom(mem_.ctx.get(), 4096, false);
         ggml_build_forward_expand(mem_.graph, output_);
@@ -1128,6 +1141,9 @@ private:
     GraphMemory mem_;
     ggml_tensor * input_ = nullptr;
     ggml_tensor * output_ = nullptr;
+    int32_t eos_ = -1;
+    int32_t first_ = -1;
+    int32_t count_ = 0;
 };
 
 class Drama3BackboneCachedDecodeGraph {
@@ -1498,8 +1514,8 @@ public:
         return forward_.run(embeddings, steps);
     }
 
-    std::vector<float> lm_head(const std::vector<float> & hidden) {
-        return lm_head_.run(hidden);
+    std::vector<float> candidate_logits(const std::vector<float> & hidden, int32_t eos, int32_t first, int32_t count) {
+        return lm_head_.run(hidden, eos, first, count);
     }
 
     std::unique_ptr<Drama3BackboneDecoderRuntime::DecodeSession> create_decode_session(int64_t cache_steps);
@@ -1580,8 +1596,9 @@ Drama3BackboneDecoderForwardResult Drama3BackboneDecoderRuntime::forward_embeddi
     return impl_->forward_embeddings(embeddings, steps);
 }
 
-std::vector<float> Drama3BackboneDecoderRuntime::lm_head(const std::vector<float> & hidden) {
-    return impl_->lm_head(hidden);
+std::vector<float> Drama3BackboneDecoderRuntime::candidate_logits(
+    const std::vector<float> & hidden, int32_t eos, int32_t first, int32_t count) {
+    return impl_->candidate_logits(hidden, eos, first, count);
 }
 
 std::unique_ptr<Drama3BackboneDecoderRuntime::DecodeSession> Drama3BackboneDecoderRuntime::create_decode_session(int64_t cache_steps) {

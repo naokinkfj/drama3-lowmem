@@ -61,7 +61,8 @@ public:
 
     std::vector<float> token_embedding(const std::vector<int32_t> & token_ids);
     Drama3BackboneDecoderForwardResult forward_embeddings(const std::vector<float> & embeddings, int64_t steps);
-    std::vector<float> lm_head(const std::vector<float> & hidden);
+    // LM head logits for [eos, first, first + 1, ..., first + count - 1] only.
+    std::vector<float> candidate_logits(const std::vector<float> & hidden, int32_t eos, int32_t first, int32_t count);
     void release_graphs();
 
     class DecodeSession {
