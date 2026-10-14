@@ -1,3 +1,14 @@
+# drama3-lowmem
+
+Run [Fish Audio Drama 3](https://huggingface.co/fishaudio/drama-3) (35B-A3B MoE TTS) **without additional quantization** on a single consumer GPU plus system RAM (target: RTX 5090 32 GB + 59 GiB RAM). Experts that do not fit in VRAM stay in RAM and are computed on the CPU, in the spirit of llama.cpp's `--n-cpu-moe`.
+
+**Built with Fish Audio.** The Drama 3 weights are licensed under the Fish Audio Community License v1.0, not under this repository's code license.
+
+- Status: work in progress. See [docs/PLAN.md](docs/PLAN.md) (Japanese) for the plan and progress.
+- Base: this repository is derived from [JarodMica/audio.cpp](https://github.com/JarodMica/audio.cpp) branch `drama-3-native` (commit `4dbb4d1`), which is a fork of [0xShug0/audio.cpp](https://github.com/0xShug0/audio.cpp). The code remains under the Apache License 2.0 (see [LICENSE](LICENSE)). The original audio.cpp README follows below.
+
+---
+
 # audio.cpp
 <a href="https://trendshift.io/repositories/64983?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-64983" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/64983" alt="0xShug0%2Faudio.cpp | Trendshift" width="250" height="55"/></a>
 [![0xShug0/audio.cpp | Trendshift](https://trendshift.io/api/badge/trendshift/repositories/64983/daily?language=C%2B%2B)](https://trendshift.io/repositories/64983?utm_source=trendshift-badge&utm_medium=badge&utm_campaign=badge-trendshift-64983)
