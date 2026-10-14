@@ -843,6 +843,26 @@ static __device__ __forceinline__ float ggml_cuda_ue4m3_to_fp32(uint8_t x) {
 #endif // defined(GGML_USE_HIP) && defined(CDNA3) && defined(FP8_AVAILABLE) && HIP_VERSION >= 60200000
 }
 
+// E4M3 magnitude bits shifted left by 7 land in FP16's exponent/mantissa fields as value * 2^-8,
+// exact for normals and subnormals. Like the CPU ggml_e4m3_to_fp32, 0x7F/0xFF decode to +-480 rather than NaN.
+static __device__ __forceinline__ uint32_t ggml_cuda_e4m3x2_to_half2_bits(const uint32_t x) {
+    return ((x & 0x00800080) << 8) | ((x & 0x007F007F) << 7);
+}
+
+static __device__ __forceinline__ float ggml_cuda_e4m3_to_fp32(const uint8_t x) {
+    const unsigned short h = ggml_cuda_e4m3x2_to_half2_bits(x);
+    return __half2float(__ushort_as_half(h)) * 256.0f;
+}
+
+// Decodes four packed E4M3 bytes to FP32 values scaled by 2^-8.
+static __device__ __forceinline__ void ggml_cuda_e4m3x4_to_fp32_scaled(const uint32_t q, float4 & v) {
+    const uint32_t lo = ggml_cuda_e4m3x2_to_half2_bits(__byte_perm(q, 0, 0x4140));
+    const uint32_t hi = ggml_cuda_e4m3x2_to_half2_bits(__byte_perm(q, 0, 0x4342));
+    const float2 f01 = __half22float2(*reinterpret_cast<const half2 *>(&lo));
+    const float2 f23 = __half22float2(*reinterpret_cast<const half2 *>(&hi));
+    v = make_float4(f01.x, f01.y, f23.x, f23.y);
+}
+
 static __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_ue4m3(float x) {
 #if defined(BLACKWELL_MMA_AVAILABLE) // This is used for NVFP4 subblock scale quantizations only
     if (!(x > 0.0f)) {

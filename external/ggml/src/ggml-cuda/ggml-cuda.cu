@@ -31,6 +31,7 @@
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
+#include "ggml-cuda/mmv-f8.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/norm.cuh"
@@ -1748,8 +1749,11 @@ static void ggml_cuda_op_mul_mat_cublas(
         (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE) || GGML_CUDA_CC_IS_AMD(cc) ||
         (GGML_CUDA_CC_IS_MTHREADS(cc) && cc >= GGML_CUDA_CC_QY2);
 
+    // F8_E4M3_B128 dequantizes to F32 so the GEMM runs with F32 inputs and compute
+    // rather than the FP16 compute type that consumer GPUs use for quantized weights.
     const bool use_fp16 =
         src0->type != GGML_TYPE_NVFP4 &&
+        src0->type != GGML_TYPE_F8_E4M3_B128 &&
         (src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) &&
         ggml_is_contiguous(src0) &&
         row_diff == src0->ne[1] &&
@@ -1936,12 +1940,27 @@ static void ggml_cuda_op_mul_mat_cublas(
                 1);
 #else
         CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
-        CUBLAS_CHECK(
-            cublasSgemm(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
-                    row_diff, src1_ncols, ne10,
-                    &alpha, src0_ddf_i,  ne00,
-                            src1_ddf1_i, ne10,
-                    &beta,  dst_dd_i,    ldc));
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        if (src0->type == GGML_TYPE_F8_E4M3_B128) {
+            // The cuBLAS handle allows TF32, which would round the exactly dequantized weights.
+            CUBLAS_CHECK(
+                cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
+                        row_diff, src1_ncols, ne10,
+                        &alpha, src0_ddf_i,  CUDA_R_32F, ne00,
+                                src1_ddf1_i, CUDA_R_32F, ne10,
+                        &beta,  dst_dd_i,    CUDA_R_32F, ldc,
+                        CUBLAS_COMPUTE_32F_PEDANTIC,
+                        CUBLAS_GEMM_DEFAULT));
+        } else
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        {
+            CUBLAS_CHECK(
+                cublasSgemm(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
+                        row_diff, src1_ncols, ne10,
+                        &alpha, src0_ddf_i,  ne00,
+                                src1_ddf1_i, ne10,
+                        &beta,  dst_dd_i,    ldc));
+        }
 #endif // defined(GGML_USE_HIP) && defined(GGML_HIP_USE_HIPBLASLT)
     }
 
@@ -2710,7 +2729,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
                                    src0->view_src;
 
-    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
+    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && src0->type != GGML_TYPE_F8_E4M3_B128 &&
+                             !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
                              dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
 
     // fusion is not universally faster on Pascal
@@ -2743,6 +2763,11 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
 
+    if (!split && ggml_cuda_should_use_mmv_f8(src0, src1, nullptr, dst)) {
+        ggml_cuda_mul_mat_vec_f8(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
     // Therefore, in such cases use cuBLAS.
@@ -2757,10 +2782,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const bool use_nvfp4_f16_mmq = !split && src0->type == GGML_TYPE_NVFP4 && src1->type == GGML_TYPE_F16 &&
         dst->type == GGML_TYPE_F32 && blackwell_mma_available(device_cc) &&
         ggml_get_op_params_i32(dst, 1) == GGML_MUL_MAT_LOWERING_CUDA_NVFP4_F16_ACTIVATION;
-    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear
+    // F8_E4M3_B128 has no MMVQ/MMQ kernels, larger batches go through cuBLAS.
+    const bool has_mmq_kernels = ggml_is_quantized(src0->type) && src0->type != GGML_TYPE_F8_E4M3_B128;
+    bool use_mul_mat_vec_q = has_mmq_kernels && !bad_padding_clear
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
         && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
-    bool use_mul_mat_q     = ggml_is_quantized(src0->type) && !bad_padding_clear
+    bool use_mul_mat_q     = has_mmq_kernels && !bad_padding_clear
         && (src1->type == GGML_TYPE_F32 || use_nvfp4_f16_mmq) && dst->type == GGML_TYPE_F32;
 
     bool any_gpus_with_slow_fp16 = false;
@@ -2844,8 +2871,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+        if (ggml_cuda_should_use_mmv_f8(src0, src1, ids, dst)) {
+            ggml_cuda_mul_mat_vec_f8(ctx, src0, src1, ids, dst);
+            return;
+        }
+
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
-        if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
+        if (ne2 <= MMVQ_MAX_BATCH_SIZE && src0->type != GGML_TYPE_F8_E4M3_B128) {
             if (ggml_is_quantized(src0->type)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
@@ -3503,7 +3535,10 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         if (node->op == GGML_OP_MUL_MAT_ID) {
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
             const int mmvq_mmid_max = get_mmvq_mmid_max_batch(node->src[0]->type, cc);
-            if (!ggml_is_quantized(node->src[0]->type) || node->ne[2] > mmvq_mmid_max) {
+            const bool needs_sync = node->src[0]->type == GGML_TYPE_F8_E4M3_B128 ?
+                !ggml_cuda_should_use_mmv_f8(node->src[0], node->src[1], node->src[2], node) :
+                (!ggml_is_quantized(node->src[0]->type) || node->ne[2] > mmvq_mmid_max);
+            if (needs_sync) {
                 // under these conditions, the mul_mat_id operation will need to synchronize the stream, so we cannot use CUDA graphs
                 // TODO: figure out a way to enable for larger batch sizes, without hurting performance
                 // ref: https://github.com/ggml-org/llama.cpp/pull/18958
@@ -5669,6 +5704,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q8_0:
                     case GGML_TYPE_MXFP4:
                     case GGML_TYPE_NVFP4:
+                    case GGML_TYPE_F8_E4M3_B128:
                     case GGML_TYPE_Q2_K:
                     case GGML_TYPE_Q3_K:
                     case GGML_TYPE_Q4_K:
@@ -5705,6 +5741,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q5_0:
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
+                    case GGML_TYPE_F8_E4M3_B128:
                         return true;
                     default:
                         return false;

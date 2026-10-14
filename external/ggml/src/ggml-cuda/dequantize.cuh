@@ -97,3 +97,12 @@ static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const in
     v.x *= d;
     v.y *= d;
 }
+
+static __device__ __forceinline__ void dequantize_f8_e4m3_b128(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_f8_e4m3_b128 * x = (const block_f8_e4m3_b128 *) vx;
+
+    const float d = x[ib].d;
+
+    v.x = ggml_cuda_e4m3_to_fp32(x[ib].qs[iqs + 0]) * d;
+    v.y = ggml_cuda_e4m3_to_fp32(x[ib].qs[iqs + 1]) * d;
+}

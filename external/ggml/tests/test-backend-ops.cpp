@@ -7527,6 +7527,7 @@ static const ggml_type all_types[] = {
     GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
     GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,
     GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
+    GGML_TYPE_F8_E4M3_B128,
 };
 
 static const ggml_type base_types[] = {
@@ -7537,7 +7538,8 @@ static const ggml_type base_types[] = {
     GGML_TYPE_Q4_1, // for I8MM tests
     GGML_TYPE_Q4_K,
     GGML_TYPE_MXFP4, GGML_TYPE_NVFP4, // TODO: or "other"
-    GGML_TYPE_IQ2_XXS
+    GGML_TYPE_IQ2_XXS,
+    GGML_TYPE_F8_E4M3_B128,
 };
 
 static const ggml_type other_types[] = {
@@ -8446,6 +8448,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // gpt-oss issue with Vulkan mmq_id
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
 
+    // Fish Audio Drama 3 MoE expert shapes (gate/up and down), decode and prefill
+    for (int n : {1, 4, 9, 32}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F8_E4M3_B128, GGML_TYPE_F32, 32, 8, false,  512, n, 2048));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F8_E4M3_B128, GGML_TYPE_F32, 32, 8, false, 2048, n,  512));
+    }
+
     for (ggml_type type_a : base_types) {
         for (ggml_type type_b : {GGML_TYPE_F32 /*, GGML_TYPE_F16 */}) {
             for (int n_mats : {4, 8}) {
@@ -9182,6 +9190,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
                 test_cases.emplace_back(new test_mul_mat(type_a, type_b, 4096, bs, 14336, {1,  1}, {1, 1}));
             }
+        }
+    }
+
+    // Fish Audio Drama 3: 256 experts, top-8, gate/up 2048 -> 512 and down 512 -> 2048
+    for (int bs : {1, 4, 8, 32, 128, 512}) {
+        for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_F8_E4M3_B128}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, false,  512, bs, 2048));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, false, 2048, bs,  512));
         }
     }
 
