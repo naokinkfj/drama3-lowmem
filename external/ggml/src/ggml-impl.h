@@ -517,6 +517,47 @@ static inline float ggml_e8m0_to_fp32_half(uint8_t x) {
 #define GGML_E8M0_TO_FP32(x) ggml_e8m0_to_fp32(x)
 #define GGML_E8M0_TO_FP32_HALF(x) ggml_e8m0_to_fp32_half(x)
 
+// E4M3 (OCP FP8): sign, 4 exponent bits (bias 7), 3 mantissa bits, no
+// infinities, 0x7F/0xFF are NaN. Shifting the magnitude bits left by 7 lands
+// them in FP16's exponent/mantissa fields, which reads as the value * 2^-8 for
+// normals and subnormals alike, so the decode is exact.
+static inline ggml_fp16_t ggml_e4m3_to_fp16_scaled(uint8_t x) {
+    return (ggml_fp16_t) (((x & 0x80) << 8) | ((x & 0x7F) << 7));
+}
+
+static inline float ggml_e4m3_to_fp32(uint8_t x) {
+    return GGML_FP16_TO_FP32(ggml_e4m3_to_fp16_scaled(x)) * 256.0f;
+}
+
+// Round to nearest even, saturating to +-448 (the largest finite value).
+static inline uint8_t ggml_fp32_to_e4m3(float f) {
+    if (f != f) {
+        return 0x7F;
+    }
+    const uint8_t sign = signbit(f) ? 0x80 : 0x00;
+    const float a = fabsf(f);
+    if (a >= 464.0f) {  // halfway between 448 and the would-be 480
+        return sign | 0x7E;
+    }
+    if (a < 0x1.0p-6f) {  // subnormal range: steps of 2^-9
+        const int m = (int) nearbyintf(a * 512.0f);  // m == 8 is the smallest normal
+        return sign | (uint8_t) m;
+    }
+    int e;
+    const float fraction = frexpf(a, &e);  // a = fraction * 2^e, fraction in [0.5, 1)
+    int exponent = e - 1;                  // a = (2 * fraction) * 2^exponent
+    int m = (int) nearbyintf((2.0f * fraction - 1.0f) * 8.0f);
+    if (m == 8) {
+        m = 0;
+        exponent += 1;
+    }
+    const int biased = exponent + 7;
+    if (biased > 15 || (biased == 15 && m == 7)) {
+        return sign | 0x7E;
+    }
+    return sign | (uint8_t) ((biased << 3) | m);
+}
+
 // UE4M3: unsigned, 4 exp bits (bias=7), 3 mantissa bits
 // Returns value * 0.5 to match kvalues_mxfp4 convention (kvalues = 2 * E2M1_float)
 static inline float ggml_ue4m3_to_fp32(uint8_t x) {

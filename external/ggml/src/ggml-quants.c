@@ -339,6 +339,25 @@ void quantize_row_mxfp4_ref(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RE
     }
 }
 
+// Real checkpoints are copied byte for byte; this path exists for tests and
+// for converting float data. d maps the block's largest magnitude to 448.
+void quantize_row_f8_e4m3_b128_ref(const float * GGML_RESTRICT x, block_f8_e4m3_b128 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_F8_E4M3_B128 == 0);
+    const int64_t nb = k / QK_F8_E4M3_B128;
+    for (int64_t i = 0; i < nb; i++) {
+        float amax = 0.0f;
+        for (int j = 0; j < QK_F8_E4M3_B128; j++) {
+            amax = MAX(amax, fabsf(x[i*QK_F8_E4M3_B128 + j]));
+        }
+        const float d = amax / 448.0f;
+        const float id = d != 0.0f ? 1.0f / d : 0.0f;
+        y[i].d = d;
+        for (int j = 0; j < QK_F8_E4M3_B128; j++) {
+            y[i].qs[j] = ggml_fp32_to_e4m3(x[i*QK_F8_E4M3_B128 + j] * id);
+        }
+    }
+}
+
 void quantize_row_nvfp4_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK_NVFP4;
     static const int qk_sub = QK_NVFP4_SUB;
@@ -520,6 +539,17 @@ void dequantize_row_mxfp4(const block_mxfp4 * GGML_RESTRICT x, float * GGML_REST
 
             y[i*qk + j + 0   ] = x0*d;
             y[i*qk + j + qk/2] = x1*d;
+        }
+    }
+}
+
+void dequantize_row_f8_e4m3_b128(const block_f8_e4m3_b128 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_F8_E4M3_B128 == 0);
+    const int64_t nb = k / QK_F8_E4M3_B128;
+    for (int64_t i = 0; i < nb; i++) {
+        const float d = x[i].d;
+        for (int j = 0; j < QK_F8_E4M3_B128; j++) {
+            y[i*QK_F8_E4M3_B128 + j] = ggml_e4m3_to_fp32(x[i].qs[j]) * d;
         }
     }
 }
@@ -2227,6 +2257,12 @@ size_t quantize_mxfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
     GGML_UNUSED(quant_weights);
     quantize_row_mxfp4_ref(src, dst, (int64_t)nrow*n_per_row);
     return nrow * ggml_row_size(GGML_TYPE_MXFP4, n_per_row);
+}
+
+size_t quantize_f8_e4m3_b128(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    quantize_row_f8_e4m3_b128_ref(src, dst, nrow*n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_F8_E4M3_B128, n_per_row);
 }
 
 size_t quantize_nvfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
@@ -5541,6 +5577,21 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_MXFP4:
             {
                 VALIDATE_ROW_DATA_E_E8M0_IMPL(block_mxfp4, data, nb);
+            } break;
+        case GGML_TYPE_F8_E4M3_B128:
+            {
+                const block_f8_e4m3_b128 * q = (const block_f8_e4m3_b128 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    if (!validate_float(q[i].d, i)) {
+                        return false;
+                    }
+                    for (int j = 0; j < QK_F8_E4M3_B128; ++j) {
+                        if ((q[i].qs[j] & 0x7F) == 0x7F) {
+                            fprintf(stderr, "%s: found NaN E4M3 code in block %zu\n", __func__, i);
+                            return false;
+                        }
+                    }
+                }
             } break;
         case GGML_TYPE_NVFP4:
             {

@@ -58,6 +58,60 @@ void quantize_row_nvfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, i
     quantize_row_nvfp4_ref(x, y, k);
 }
 
+void quantize_row_f8_e4m3_b128(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_f8_e4m3_b128_ref(x, y, k);
+}
+
+// FP8 weights against F32 activations. Activations stay F32 (no lossy
+// re-quantization); each block's scale is applied once to its partial sum.
+// At batch 1 this is bound by reading the weights, about 1 byte per value.
+void ggml_vec_dot_f8_e4m3_b128_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    assert(n % QK_F8_E4M3_B128 == 0);
+    GGML_UNUSED(nrc);
+    GGML_UNUSED(bx);
+    GGML_UNUSED(by);
+    GGML_UNUSED(bs);
+    const block_f8_e4m3_b128 * GGML_RESTRICT x = vx;
+    const float * GGML_RESTRICT y = vy;
+    const int nb = n / QK_F8_E4M3_B128;
+#if defined(__AVX512F__)
+    const __m512i sign_mask = _mm512_set1_epi16(0x80);
+    const __m512i magnitude_mask = _mm512_set1_epi16(0x7F);
+    __m512 total = _mm512_setzero_ps();
+    for (int ib = 0; ib < nb; ++ib) {
+        const uint8_t * GGML_RESTRICT q = x[ib].qs;
+        const float * GGML_RESTRICT yb = y + ib*QK_F8_E4M3_B128;
+        __m512 acc0 = _mm512_setzero_ps();
+        __m512 acc1 = _mm512_setzero_ps();
+        for (int j = 0; j < QK_F8_E4M3_B128; j += 32) {
+            // 32 codes -> 32 FP16 values equal to the E4M3 value * 2^-8
+            const __m512i codes = _mm512_cvtepu8_epi16(_mm256_loadu_si256((const __m256i *) (q + j)));
+            const __m512i halves = _mm512_or_si512(
+                _mm512_slli_epi16(_mm512_and_si512(codes, sign_mask), 8),
+                _mm512_slli_epi16(_mm512_and_si512(codes, magnitude_mask), 7));
+            const __m512 w0 = _mm512_cvtph_ps(_mm512_castsi512_si256(halves));
+            const __m512 w1 = _mm512_cvtph_ps(_mm512_extracti64x4_epi64(halves, 1));
+            acc0 = _mm512_fmadd_ps(w0, _mm512_loadu_ps(yb + j), acc0);
+            acc1 = _mm512_fmadd_ps(w1, _mm512_loadu_ps(yb + j + 16), acc1);
+        }
+        // 256 undoes the 2^-8 from the FP16 reinterpretation; it is exact.
+        total = _mm512_fmadd_ps(_mm512_add_ps(acc0, acc1), _mm512_set1_ps(x[ib].d * 256.0f), total);
+    }
+    *s = _mm512_reduce_add_ps(total);
+#else
+    float sumf = 0.0f;
+    for (int ib = 0; ib < nb; ++ib) {
+        float block_sum = 0.0f;
+        for (int j = 0; j < QK_F8_E4M3_B128; ++j) {
+            block_sum += ggml_e4m3_to_fp32(x[ib].qs[j]) * y[ib*QK_F8_E4M3_B128 + j];
+        }
+        sumf += block_sum * x[ib].d;
+    }
+    *s = sumf;
+#endif
+}
+
 //
 // 2-6 bit quantization in super-blocks
 //

@@ -437,7 +437,12 @@ extern "C" {
         // would silently misread GGUF files that still carry the old type.
         GGML_TYPE_I8_S    = 42,
         GGML_TYPE_I2_S    = 43,
-        GGML_TYPE_COUNT   = 44,
+        // drama3-lowmem: 128 FP8 E4M3 values sharing one FP32 scale. Holds
+        // DeepSeek-style 128x128 block-scaled FP8 checkpoints exactly: each row
+        // chunk of 128 columns lies inside one scale block. Not upstream's
+        // scalar "f8_e4m3", which has no scale.
+        GGML_TYPE_F8_E4M3_B128 = 44,
+        GGML_TYPE_COUNT   = 45,
     };
 
     // precision

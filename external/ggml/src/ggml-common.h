@@ -216,6 +216,13 @@ typedef struct {
 } block_nvfp4;
 static_assert(sizeof(block_nvfp4) == sizeof(uint8_t)*(QK_NVFP4/QK_NVFP4_SUB) + QK_NVFP4/2, "wrong nvfp4 block size/padding");
 
+#define QK_F8_E4M3_B128 128
+typedef struct {
+    float   d;                    // FP32 scale (the checkpoint's inverse scale)
+    uint8_t qs[QK_F8_E4M3_B128];  // FP8 E4M3 values, bias 7, 0x7F/0xFF are NaN
+} block_f8_e4m3_b128;
+static_assert(sizeof(block_f8_e4m3_b128) == sizeof(float) + QK_F8_E4M3_B128, "wrong f8_e4m3_b128 block size/padding");
+
 #define QK5_0 32
 typedef struct {
     ggml_half d;           // delta
