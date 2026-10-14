@@ -3,6 +3,7 @@
 #include "engine/framework/audio/wav_reader.h"
 #include "engine/framework/runtime/options.h"
 #include "engine/framework/text/chunking.h"
+#include "engine/community_models/fish_drama3/text_chunks.h"
 
 #include <algorithm>
 #include <cctype>
@@ -32,23 +33,6 @@ codecs::FishDacCodes parse_codes(const json::Value & value, int64_t codebook_siz
     }
     validate_drama3_codes(codes, codebook_size);
     return codes;
-}
-
-// Splits "<|speaker:0|>a<|speaker:1|>b" into one request per speaker turn, so
-// each turn is generated as a continuation of the previous one.
-std::vector<runtime::TaskRequest> speaker_turns(const runtime::TaskRequest & request) {
-    const std::string & text = request.text_input->text;
-    std::vector<runtime::TaskRequest> turns;
-    size_t begin = 0;
-    while (begin < text.size()) {
-        size_t next = text.find("<|speaker:", begin + 1);
-        if (next == std::string::npos) next = text.size();
-        auto turn = request;
-        turn.text_input->text = text.substr(begin, next - begin);
-        if (turn.text_input->text.find_first_not_of(" \t\r\n") != std::string::npos) turns.push_back(std::move(turn));
-        begin = next;
-    }
-    return turns.empty() ? std::vector<runtime::TaskRequest>{request} : turns;
 }
 
 // Codepoints that are spoken: tags such as <|speaker:0|> or [laughs], white
@@ -227,8 +211,10 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
     const int64_t chunk_size = runtime::parse_positive_i64_option(effective.options, {"text_chunk_size"}, 60);
     const auto mode = engine::text::parse_text_chunk_mode_override(effective.options).value_or(engine::text::TextChunkMode::TagAware);
     std::vector<runtime::TaskRequest> chunks;
-    for (const auto & turn : split_turns ? speaker_turns(effective) : std::vector<runtime::TaskRequest>{effective}) {
-        for (auto & chunk : runtime::chunk_text_request(turn, chunk_size, mode)) chunks.push_back(std::move(chunk));
+    for (auto & text : drama3_text_chunks(effective.text_input->text, chunk_size, mode, split_turns)) {
+        auto chunk = effective;
+        chunk.text_input->text = std::move(text);
+        chunks.push_back(std::move(chunk));
     }
     runtime::TaskResult result;
     runtime::AudioBuffer merged;
@@ -261,7 +247,12 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
             std::cerr << "[fish_drama3] take " << (generated.stalled ? "stalled" : "ended early")
                       << "; regenerating chunk " << index << " (attempt " << attempt << ")\n";
             chunk_sampling.seed += 7919U;
-            generated = generator_->generate(text, references, context, chunk_sampling, streaming, callback);
+            // A retry that ends before its first frame throws; keep the take we have.
+            try {
+                generated = generator_->generate(text, references, context, chunk_sampling, streaming, callback);
+            } catch (const std::exception & error) {
+                std::cerr << "[fish_drama3] retry failed: " << error.what() << '\n';
+            }
         }
         runtime::append_audio_buffer(merged, generated.audio);
         limited = limited || generated.reached_limit;

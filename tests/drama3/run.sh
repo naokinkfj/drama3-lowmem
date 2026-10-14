@@ -11,3 +11,10 @@ g++ -std=c++17 -O2 -march=native -fopenmp \
     "$build_dir/ggml/src/libggml-cpu.a" "$build_dir/ggml/src/libggml-base.a" \
     -lpthread -lm -o "$build_dir/tests/test_sampler_graph"
 "$build_dir/tests/test_sampler_graph"
+cmake --build "$build_dir" --target engine_runtime -j "$(nproc)" > /dev/null
+g++ -std=c++17 -O2 -I include \
+    tests/drama3/test_text_chunks.cpp src/community_models/fish_drama3/text_chunks.cpp \
+    -Wl,--start-group "$build_dir/libengine_runtime.a" "$build_dir/libcjson_vendor.a" "$build_dir/libyaml_vendor.a" \
+    "$build_dir/ggml/src/libggml-cpu.a" "$build_dir/ggml/src/libggml-base.a" -Wl,--end-group \
+    -fopenmp -lpthread -ldl -o "$build_dir/tests/test_text_chunks"
+"$build_dir/tests/test_text_chunks"

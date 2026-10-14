@@ -361,16 +361,6 @@ Drama3Generation Drama3Generator::generate(const std::string & text, const std::
         repeat_run = !output_frames.empty() && output_frames.size() > 1 && output_frames[output_frames.size() - 2][0] == next[0]
             ? repeat_run + 1 : 1;
         if (background_codec) background_codec->push(next);
-        if (sampling.stall_frames > 0 && repeat_run >= sampling.stall_frames && teacher.empty()) {
-            // Offline: keep a short pause of the repeated frame and drop the
-            // rest (its audio is trimmed to match below). Streamed frames have
-            // already been delivered, so the codes keep them too.
-            if (!streaming) {
-                output_frames.resize(output_frames.size() - static_cast<size_t>(repeat_run) + std::min<size_t>(repeat_run, 8));
-            }
-            result.stalled = true;
-            break;
-        }
         if (step == 0) mark_phase("tower_first_frame_ms");
         recent.push_back(next[0]);
         if (recent.size() > 16) recent.pop_front();
@@ -390,6 +380,18 @@ Drama3Generation Drama3Generator::generate(const std::string & text, const std::
             }
         }
         split(codec_ms);
+        // Checked after this frame was decoded (and streamed), so codes and
+        // audio stay in step.
+        if (sampling.stall_frames > 0 && repeat_run >= sampling.stall_frames && teacher.empty()) {
+            // Offline: keep a short pause of the repeated frame and drop the
+            // rest (its audio is trimmed to match below). Streamed frames have
+            // already been delivered, so the codes keep them too.
+            if (!streaming) {
+                output_frames.resize(output_frames.size() - static_cast<size_t>(repeat_run) + std::min<size_t>(repeat_run, 8));
+            }
+            result.stalled = true;
+            break;
+        }
         if (step + 1 == sampling.max_frames) { result.reached_limit = true; break; }
         current = next;
         auto embedding = backbone_->token_embedding({current[0]});

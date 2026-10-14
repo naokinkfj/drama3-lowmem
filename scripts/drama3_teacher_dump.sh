@@ -21,9 +21,9 @@ mkdir -p "$output"
 for name in $(python3 -c 'import json,sys; print(" ".join(c["name"] for c in json.load(open(sys.argv[1]))))' "$cases"); do
     case_dir="$output/$name"
     mkdir -p "$case_dir"
-    # One generate() call per case: speaker-turn splitting would overwrite the
-    # dump once per turn, so it is turned off here.
-    python3 -c 'import json,sys; json.dump([dict(c, options=dict(c.get("options", {}), split_speaker_turns="false")) for c in json.load(open(sys.argv[1])) if c["name"] == sys.argv[2]], open(sys.argv[3], "w"), ensure_ascii=False)' \
+    # One generate() call per case: chunking by speaker turn or length would
+    # overwrite the dump once per chunk, so both are turned off here.
+    python3 -c 'import json,sys; json.dump([dict(c, options=dict(c.get("options", {}), split_speaker_turns="false", text_chunk_size="100000")) for c in json.load(open(sys.argv[1])) if c["name"] == sys.argv[2]], open(sys.argv[3], "w"), ensure_ascii=False)' \
         "$cases" "$name" "$case_dir/case.json"
     extra=(--session-option "fish_drama3.teacher_dump=$case_dir")
     if [[ -n "$frames_from" ]]; then
