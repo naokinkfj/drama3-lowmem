@@ -154,3 +154,15 @@ the bit-identity of the default path, which this mode leaves untouched.
 | `run` after the cleanup pass | outputs bit-identical to the run before it |
 | `run` after adding `--emulate official` (en_short, en_clone, ja_long) | `ref_*` outputs bit-identical to the run before it |
 | `make_case.py` | detokenized rows reproduce the `reference-bracket-v1` template; text rows carry zero codes; reference rows are `[semantic_begin + c0, c0..c9]` |
+
+### Official emulation vs the exact reference (per decode step, `compare_dump.py`)
+
+| Case | hidden rel-L2 mean / max | cosine mean | semantic top-1 / top-10 | residual top-1 min | (row, layer) expert sets that differ |
+|---|---|---|---|---|---|
+| en_short (P44, F134) | 0.042 / 0.095 | 0.99904 | 0.970 / 0.959 | 0.925 | 2371 of 7120 |
+| en_clone (P158, F89) | 0.046 / 0.099 | 0.99884 | 0.876 / 0.947 | 0.865 | 4334 of 9880 |
+| ja_long (P104, F585) | 0.036 / 0.119 | 0.99928 | 0.933 / 0.969 | 0.928 | 10146 of 27560 |
+
+BF16 router logits put many routing decisions within one BF16 step, so the emulated
+runtime already selects a different expert set from row 0 (the first `<|im_start|>`,
+layers 15, 16 and 23).
