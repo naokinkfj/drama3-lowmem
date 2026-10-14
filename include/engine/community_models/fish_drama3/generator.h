@@ -52,6 +52,10 @@ private:
     std::unique_ptr<Drama3Tower> tower_;
     std::unique_ptr<core::ExecutionContext> codec_execution_;
     std::unique_ptr<codecs::FishDacCodecRuntime> codec_;
+    // Reference encoding runs once per reference; on a device backend it runs
+    // on the CPU, because the encode graph needs ~2 GiB of VRAM for 25 s.
+    std::unique_ptr<core::ExecutionContext> encoder_execution_;
+    std::unique_ptr<codecs::FishDacCodecRuntime> encoder_;
     std::optional<runtime::AudioBuffer> cached_reference_audio_;
     codecs::FishDacCodes cached_reference_codes_;
 };

@@ -237,6 +237,17 @@
         "type": "string",
         "description": "Validation only: JSON file of frames to force instead of sampling (use with teacher_dump).",
         "required": false
+      },
+      {
+        "name": "reference_encoder",
+        "type": "enum",
+        "description": "drama3-lowmem: where reference audio is encoded. cpu (default) keeps the ~2 GiB encode graph for a 25 s clip off the GPU; it runs once per reference.",
+        "required": false,
+        "values": [
+          "cpu",
+          "same"
+        ],
+        "default": "cpu"
       }
     ],
     "load": []

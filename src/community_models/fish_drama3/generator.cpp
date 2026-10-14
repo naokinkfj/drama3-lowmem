@@ -207,6 +207,19 @@ Drama3Generator::Drama3Generator(std::shared_ptr<const Drama3Assets> assets,
         assets_->codec, {}, codec_execution_->backend(), codec_backend.type, codec_options);
     codec_ = std::make_unique<codecs::FishDacCodecRuntime>(component, codec_backend,
         codec_backend.threads, codec_options.graph_arena_bytes);
+    const auto encoder_choice = runtime::find_option(options.options, {"fish_drama3.reference_encoder"}).value_or("cpu");
+    if (encoder_choice != "cpu" && encoder_choice != "same") {
+        throw std::runtime_error("fish_drama3.reference_encoder requires cpu or same");
+    }
+    if (encoder_choice == "cpu" && codec_backend.type != core::BackendType::Cpu) {
+        auto encoder_backend = codec_backend;
+        encoder_backend.type = core::BackendType::Cpu;
+        encoder_execution_ = std::make_unique<core::ExecutionContext>(encoder_backend);
+        const auto encoder_component = codecs::FishDacCodecComponent::load_from_tensor_source(assets_->codec_weights,
+            assets_->codec, {}, encoder_execution_->backend(), encoder_backend.type, codec_options);
+        encoder_ = std::make_unique<codecs::FishDacCodecRuntime>(encoder_component, encoder_backend,
+            encoder_backend.threads, codec_options.graph_arena_bytes);
+    }
     assets_->model_weights->release_storage();
     assets_->codec_weights->release_storage();
 }
@@ -218,8 +231,9 @@ codecs::FishDacCodes Drama3Generator::encode_reference(const runtime::AudioBuffe
         cached_reference_audio_->channels == audio.channels && cached_reference_audio_->samples == audio.samples) {
         return cached_reference_codes_;
     }
-    auto result = codec_->encode_codes(audio);
-    codec_->release_encode_graph();
+    auto & encoder = encoder_ ? *encoder_ : *codec_;
+    auto result = encoder.encode_codes(audio);
+    encoder.release_encode_graph();
     validate_drama3_codes(result, assets_->tower.codebook_size);
     // Keep one short reference in host memory. Exact waveform equality avoids
     // stale path-based hits when an uploaded file is replaced or re-decoded.
