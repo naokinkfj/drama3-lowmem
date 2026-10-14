@@ -39,6 +39,7 @@ enum class TensorStorageType {
     Q6_K,
     Q8_0,
     NVFP4,
+    F8_E4M3_B128,
 };
 
 struct TensorMetadata {

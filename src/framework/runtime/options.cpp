@@ -114,6 +114,8 @@ std::string tensor_storage_type_name(assets::TensorStorageType storage_type) {
         return "q8_0";
     case assets::TensorStorageType::NVFP4:
         return "nvfp4";
+    case assets::TensorStorageType::F8_E4M3_B128:
+        return "f8_e4m3_b128";
     }
     throw std::runtime_error("unknown tensor storage type");
 }

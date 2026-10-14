@@ -42,6 +42,9 @@ parser.add_argument("--embedding-type", choices=("orig", "f16", "q4_0", "q4_1", 
                     help="Main text embedding storage; defaults to Q8_0 and exposes CUDA-supported row lookup types")
 parser.add_argument("--expert-float", choices=("f16", "bf16"), default="f16",
                     help="Intermediate storage for the scaled FP8 experts after applying their block scales")
+parser.add_argument("--fp8-expert-layers", type=int, default=0,
+                    help="Keep the routed experts of the first N layers as shipped (FP8 E4M3 bytes plus their FP32 "
+                         "block scales, ggml type f8_e4m3_b128) instead of expanding them")
 parser.add_argument("--threads", type=int, default=8)
 arguments = parser.parse_args()
 if arguments.threads <= 0:
@@ -110,6 +113,32 @@ STORAGE_TORCH = {"f32": torch.float32, "f16": torch.float16, "bf16": torch.bfloa
 # numpy has no bfloat16; BF16 tensors are written as raw 16-bit words.
 STORAGE_NUMPY = {"f32": np.float32, "f16": np.float16, "bf16": np.uint16}
 STORAGE_RAW = {"f32": None, "f16": None, "bf16": gguf.GGMLQuantizationType.BF16}
+# drama3-lowmem's GGML_TYPE_F8_E4M3_B128: { float d; uint8_t qs[128]; } per 128 values.
+# gguf-py does not know this type, so it is written with its raw type id.
+F8_TYPE_ID, F8_BLOCK, F8_BLOCK_BYTES = 44, 128, 132
+
+
+def tensor_nbytes(shape, storage):
+    if storage == "f8":
+        return math.prod(shape) // F8_BLOCK * F8_BLOCK_BYTES
+    return math.prod(shape) * np.dtype(STORAGE_NUMPY[storage]).itemsize
+
+
+def load_fp8_blocks(tensor_name):
+    """Pack one FP8 matrix and its 128x128 inverse scales into f8_e4m3_b128 blocks without touching the values."""
+    codes = shards[weight_map[tensor_name]].get_tensor(tensor_name)
+    if codes.dtype != torch.float8_e4m3fn:
+        raise RuntimeError(f"{tensor_name} is {codes.dtype}, expected float8_e4m3fn")
+    scale = shards[weight_map[tensor_name + "_scale_inv"]].get_tensor(tensor_name + "_scale_inv").float()
+    rows, cols = codes.shape
+    if cols % F8_BLOCK:
+        raise RuntimeError(f"{tensor_name}: {cols} columns is not a multiple of {F8_BLOCK}")
+    code_bytes = codes.view(torch.uint8).numpy().reshape(rows, cols // F8_BLOCK, F8_BLOCK)
+    row_scales = scale.repeat_interleave(F8_BLOCK, 0)[:rows].numpy().astype(np.float32)
+    blocks = np.empty((rows, cols // F8_BLOCK, F8_BLOCK_BYTES), dtype=np.uint8)
+    blocks[:, :, :4] = row_scales.reshape(rows, cols // F8_BLOCK, 1).view(np.uint8)
+    blocks[:, :, 4:] = code_bytes
+    return blocks
 
 
 def storage_type(shape, source_dtype):
@@ -148,7 +177,8 @@ for layer_index in range(layer_count):
     for projection_name in ("gate_proj", "up_proj", "down_proj"):
         matrix_shape = (expert_width, hidden_width) if projection_name != "down_proj" else (hidden_width, expert_width)
         tensor_name = f"model.language_model.layers.{layer_index}.mlp.experts.{projection_name}.weight"
-        tensor_plan.append(("model_weights/" + tensor_name, (expert_count, *matrix_shape), arguments.expert_float, (layer_index, projection_name)))
+        storage = "f8" if layer_index < arguments.fp8_expert_layers else arguments.expert_float
+        tensor_plan.append(("model_weights/" + tensor_name, (expert_count, *matrix_shape), storage, (layer_index, projection_name)))
 
 codec = torch.load(arguments.checkpoint / "codec.pth", map_location="cpu", weights_only=True)
 codec = codec.get("state_dict", codec)
@@ -176,8 +206,12 @@ writer.add_array("audiocpp.tensor_names", [tensor_name for tensor_name, _, _, _ 
 writer.add_key_value("audiocpp.tensor_ranks", [len(shape) for _, shape, _, _ in tensor_plan], gguf.GGUFValueType.ARRAY, gguf.GGUFValueType.INT32)
 writer.add_key_value("audiocpp.tensor_shapes", [dimension for _, shape, _, _ in tensor_plan for dimension in shape], gguf.GGUFValueType.ARRAY, gguf.GGUFValueType.INT64)
 for tensor_index, (tensor_name, tensor_shape, storage, _) in enumerate(tensor_plan):
-    tensor_dtype = np.dtype(STORAGE_NUMPY[storage])
-    writer.add_tensor_info(f"_audiocpp.{tensor_index}", tensor_shape, tensor_dtype, math.prod(tensor_shape) * tensor_dtype.itemsize,
+    if storage == "f8":
+        # np.int8 keeps gguf-py from reinterpreting the shape as bytes; the type id is written as is.
+        writer.add_tensor_info(f"_audiocpp.{tensor_index}", tensor_shape, np.dtype(np.int8), tensor_nbytes(tensor_shape, storage),
+                               raw_dtype=F8_TYPE_ID)
+        continue
+    writer.add_tensor_info(f"_audiocpp.{tensor_index}", tensor_shape, np.dtype(STORAGE_NUMPY[storage]), tensor_nbytes(tensor_shape, storage),
                            raw_dtype=STORAGE_RAW[storage])
 writer.write_header_to_file()
 writer.write_kv_data_to_file()
@@ -185,6 +219,13 @@ writer.write_ti_data_to_file()
 for tensor_index, (tensor_name, tensor_shape, storage, source_name) in enumerate(tensor_plan):
     if tensor_name.startswith("codec_weights/"):
         tensor_values = folded_codec[tensor_name.removeprefix("codec_weights/")]
+    elif isinstance(source_name, tuple) and storage == "f8":
+        layer_index, projection_name = source_name
+        blocks = [load_fp8_blocks(f"model.language_model.layers.{layer_index}.mlp.experts.{expert_index}.{projection_name}.weight")
+                  for expert_index in range(expert_count)]
+        writer.write_tensor_data(np.stack(blocks))
+        print(f"{tensor_index + 1}/{len(tensor_plan)} {tensor_name} (f8_e4m3_b128)", flush=True)
+        continue
     elif isinstance(source_name, tuple):
         layer_index, projection_name = source_name
         tensor_values = torch.empty(tensor_shape, dtype=STORAGE_TORCH[storage])
