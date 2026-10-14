@@ -43,9 +43,9 @@ experts).
 RTX 5090 32 GB, Ryzen 9 9950X3D, 59 GiB RAM, CUDA 12.9, Linux. RTF is generation
 time divided by audio length (lower is faster; 1.0 is real time).
 
-| Package | CPU expert layers | RTF (short / long / clone / dialogue) | Peak VRAM |
+| Package | CPU expert layers | RTF (EN short / JA short / JA long / dialogue) | Peak VRAM |
 |---|---|---|---|
-| FP8, unquantized (this project) | 9 | 0.32 / 0.29 / 0.36 / 0.33 | 31.7 GB |
+| FP8, unquantized (this project) | 9 | 0.36 / 0.30 / 0.31 / 0.34 | 31.9 GB |
 | FP8, unquantized (this project) | 12 | 0.36 / 0.33 / - / - | 29.1 GB |
 | F16-expanded experts (first attempt) | 26 | 1.25-2.2 | 30.1 GB |
 | Community Q4_K_S (for comparison, quantized) | 0 | 0.27 | 23.7 GB |
@@ -54,8 +54,11 @@ Per frame at 9 CPU layers: backbone about 10 ms, audio tower 2.8 ms, sampling
 0.4 ms; codec decoding overlaps with generation on a background thread. The
 process uses about 10 GB of system RAM at 9 CPU layers.
 
-Reference audio is encoded on the CPU once per voice (about 7 s for a 25 s clip)
-and cached; later requests with the same voice pay nothing.
+Voice cloning: the first request with a new reference also encodes it on the
+CPU (about 1 s for a 4 s clip, 7 s for a 25 s clip), so a 3.4 s clone took RTF
+0.69; later requests with the same voice reuse the codes (RTF 0.37). All
+outputs above transcribe back to their input text with Whisper (character error
+rate 0-3 %, the 3 % being a kana/kanji spelling difference).
 
 ## Accuracy
 
