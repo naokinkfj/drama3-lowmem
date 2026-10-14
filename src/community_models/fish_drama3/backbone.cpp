@@ -184,6 +184,7 @@ struct Drama3BackboneWeights {
     std::vector<Drama3BackboneLayerWeights> layers;
     modules::NormWeights final_norm;
     modules::LinearWeights lm_head;
+    core::TensorValue lm_head_candidates;
 };
 
 FullAttentionWeights load_full_attention(
@@ -272,7 +273,9 @@ std::shared_ptr<Drama3BackboneWeights> load_qwen35_weights(
     if (c.cpu_expert_layers < 0 || c.cpu_expert_layers > c.layers) {
         throw std::runtime_error("Drama 3 cpu_expert_layers must be between zero and the layer count");
     }
-    if (c.cpu_expert_layers > 0 && execution.backend_type() != core::BackendType::Cpu) {
+    // A host store is kept for any device backend: besides CPU-resident
+    // experts it holds the token embedding, which is read one row per step.
+    if (execution.backend_type() != core::BackendType::Cpu) {
         core::BackendConfig host;
         host.threads = execution.config().threads;
         weights->cpu_execution = std::make_shared<core::ExecutionContext>(host);
@@ -281,7 +284,7 @@ std::shared_ptr<Drama3BackboneWeights> load_qwen35_weights(
             "drama3_backbone.host_experts", weight_context_bytes);
     }
     const std::string & root = c.weight_prefix;
-    weights->token_embedding = weights->store->load_tensor(
+    weights->token_embedding = (weights->cpu_store ? *weights->cpu_store : *weights->store).load_tensor(
         source,
         root + ".embed_tokens.weight",
         storage_type,
@@ -312,6 +315,19 @@ std::shared_ptr<Drama3BackboneWeights> load_qwen35_weights(
     weights->final_norm = binding::norm_weight_from_source(*weights->store, source, root + ".norm", c.hidden_size);
     if (c.tie_word_embeddings) {
         weights->lm_head = {weights->token_embedding, std::nullopt};
+    } else if (c.lm_head_count > 0) {
+        // The sampler reads ~4k of ~250k rows; keeping only those frees ~1 GB of VRAM.
+        if (c.lm_head_eos < 0 || c.lm_head_first < 0 || c.lm_head_eos >= c.vocab_size ||
+            c.lm_head_first + c.lm_head_count > c.vocab_size) {
+            throw std::runtime_error("Drama 3 LM head candidate rows are out of range");
+        }
+        const auto full = source.require_f32(c.lm_head_prefix + ".weight", {c.vocab_size, c.hidden_size});
+        std::vector<float> rows(static_cast<size_t>((c.lm_head_count + 1) * c.hidden_size));
+        std::copy_n(full.begin() + static_cast<size_t>(c.lm_head_eos) * c.hidden_size, c.hidden_size, rows.begin());
+        std::copy_n(full.begin() + static_cast<size_t>(c.lm_head_first) * c.hidden_size,
+                    static_cast<size_t>(c.lm_head_count * c.hidden_size), rows.begin() + c.hidden_size);
+        weights->lm_head_candidates = weights->store->make_f32(
+            core::TensorShape::from_dims({c.lm_head_count + 1, c.hidden_size}), std::move(rows));
     } else {
         weights->lm_head = binding::linear_from_source(
             *weights->store,
@@ -1113,14 +1129,21 @@ private:
         auto x = core::make_tensor(input_ctx, GGML_TYPE_F32, core::TensorShape::from_dims({1, 1, config_.hidden_size}));
         input_ = x.tensor;
         ggml_set_input(input_);
-        ggml_tensor * weight = weights_->lm_head.weight.tensor;
-        if (eos_ < 0 || first_ < 0 || count_ <= 0 || first_ + count_ > weight->ne[1] || eos_ >= weight->ne[1]) {
-            throw std::runtime_error("Drama 3 LM head candidate rows are out of range");
-        }
-        ggml_tensor * eos_row = ggml_view_2d(ctx.ggml, weight, weight->ne[0], 1, weight->nb[1], static_cast<size_t>(eos_) * weight->nb[1]);
-        ggml_tensor * code_rows = ggml_view_2d(ctx.ggml, weight, weight->ne[0], count_, weight->nb[1], static_cast<size_t>(first_) * weight->nb[1]);
         ggml_tensor * column = ggml_reshape_2d(ctx.ggml, x.tensor, config_.hidden_size, 1);
-        output_ = ggml_concat(ctx.ggml, ggml_mul_mat(ctx.ggml, eos_row, column), ggml_mul_mat(ctx.ggml, code_rows, column), 0);
+        if (weights_->lm_head_candidates.tensor != nullptr) {
+            if (eos_ != config_.lm_head_eos || first_ != config_.lm_head_first || count_ != config_.lm_head_count) {
+                throw std::runtime_error("Drama 3 LM head was loaded for other candidate rows");
+            }
+            output_ = ggml_mul_mat(ctx.ggml, weights_->lm_head_candidates.tensor, column);
+        } else {
+            ggml_tensor * weight = weights_->lm_head.weight.tensor;
+            if (eos_ < 0 || first_ < 0 || count_ <= 0 || first_ + count_ > weight->ne[1] || eos_ >= weight->ne[1]) {
+                throw std::runtime_error("Drama 3 LM head candidate rows are out of range");
+            }
+            ggml_tensor * eos_row = ggml_view_2d(ctx.ggml, weight, weight->ne[0], 1, weight->nb[1], static_cast<size_t>(eos_) * weight->nb[1]);
+            ggml_tensor * code_rows = ggml_view_2d(ctx.ggml, weight, weight->ne[0], count_, weight->nb[1], static_cast<size_t>(first_) * weight->nb[1]);
+            output_ = ggml_concat(ctx.ggml, ggml_mul_mat(ctx.ggml, eos_row, column), ggml_mul_mat(ctx.ggml, code_rows, column), 0);
+        }
         ggml_set_output(output_);
         mem_.graph = ggml_new_graph_custom(mem_.ctx.get(), 4096, false);
         ggml_build_forward_expand(mem_.graph, output_);
@@ -1501,7 +1524,7 @@ public:
         assets::TensorStorageType storage_type)
         : config_(std::move(config)),
           weights_(load_qwen35_weights(*source, config_, execution, weight_context_bytes, storage_type)),
-          token_embedding_(execution, weights_, config_, graph_arena_bytes),
+          token_embedding_(weights_->cpu_execution ? *weights_->cpu_execution : execution, weights_, config_, graph_arena_bytes),
           forward_(execution, weights_, config_, graph_arena_bytes),
           lm_head_(execution, weights_, config_, graph_arena_bytes),
           decode_graph_(execution, weights_, config_, config_.decode_cache_steps, graph_arena_bytes) {}

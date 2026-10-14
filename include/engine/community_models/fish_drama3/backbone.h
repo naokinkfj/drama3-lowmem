@@ -36,6 +36,11 @@ struct Drama3BackboneDecoderConfig {
     bool round_bf16_activations = false;
     int64_t decode_cache_steps = 2048;
     int64_t cpu_expert_layers = 0;
+    // When set, only these LM head rows (eos, then lm_head_count rows from
+    // lm_head_first) are kept on the device, as F32.
+    int32_t lm_head_eos = -1;
+    int32_t lm_head_first = -1;
+    int32_t lm_head_count = 0;
     size_t prefill_cache_bytes = 256u * 1024u * 1024u;
     bool profile_prefill_cache = false;
 };
