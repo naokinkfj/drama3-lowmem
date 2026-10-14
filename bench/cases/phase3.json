@@ -1,0 +1,7 @@
+[
+  {"name": "en_short", "language": "en", "text": "Hello, how are you? The weather is lovely today, so let's take a long walk by the river."},
+  {"name": "ja_short", "language": "ja", "text": "こんにちは。今日はとても良い天気なので、川沿いを散歩しに行きましょう。"},
+  {"name": "ja_long", "language": "ja", "text": "今日は、家庭で動かす人工知能の話をします。最近の音声合成モデルはとても大きく、そのままでは一般的なパソコンのメモリに収まりません。そこで、よく使う部分だけをグラフィックボードに置き、残りをメインメモリに置いて計算する工夫が生まれました。少し遅くはなりますが、高価な機材がなくても、自然な声で長い文章を読み上げられるようになります。"},
+  {"name": "en_clone", "language": "en", "text": "Get the trust fund to the bank early, and call me when you are done.", "voice_ref": "models/refs/common_voice_en_10119832.wav", "reference_text": "We asked over twenty different people, and they all said it was his."},
+  {"name": "ja_dialogue", "language": "ja", "text": "<|speaker:0|>ねえ、昨日の夜のニュース見た？<|speaker:1|>見たよ。新しい音声合成の話でしょう？<|speaker:0|>そうそう。家のパソコンでも動くらしいよ。<|speaker:1|>本当に？それなら試してみたいな。"}
+]
