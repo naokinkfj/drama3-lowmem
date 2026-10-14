@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
-"""Compare a port's teacher-forced dump with the reference outputs in the same directory.
+"""Compare two sets of teacher-forced Drama 3 outputs, per decode step.
 
-Port files read when present (little-endian float32), as the fish_drama3 teacher dump
-writes them:
-  hidden_prefill.f32 [P+F, 2048]   final-norm hidden of every row
-  hidden_decode.f32  [>=F, 2048]   hidden at row P-1+t (the row each decode step reads)
-  semantic.f32       [>=F, 4097]   main-token logits, [eos, semantic band]
-  residual.f32       [F, 9, 4096]  codebook 1..9 logits
-Extra trailing decode rows of the port (a step after the last frame) are ignored.
+A source is DIR:KIND. KIND is
+  port  the port's teacher dump: hidden_decode.f32 [>=F, 2048] (hidden at row P-1+t),
+        semantic.f32 [>=F, 4097], residual.f32 [F, 9, 4096]; extra trailing decode
+        rows (a step after the last frame) are ignored
+  ref   drama3_reference.py run:                      ref_hidden / ref_semantic / ...
+  off   drama3_reference.py run --emulate official:   off_hidden / off_semantic / ...
+The second source is the baseline. meta.json (prompt rows, frames) is read from the
+first directory that has one.
 
-  compare_dump.py <case_dir> [<case_dir> ...]
+  compare_dump.py runs/tf/fp8/en_short:port runs/tf/f16/en_short:off
+
+Prints JSON: per-step hidden cosine and relative L2 (min / mean / max), semantic
+top-1 agreement, top-10 overlap and relative L2, residual top-1 agreement per book
+and relative L2. When both sources have a router table (ref / off), also the rows
+and layers whose top-8 expert sets differ, and the baseline's closest router ties.
 """
 
 from __future__ import annotations
@@ -21,59 +27,110 @@ import sys
 import numpy as np
 
 
-def load(directory: str, name: str, *shape: int) -> np.ndarray | None:
-    path = os.path.join(directory, name)
-    if not os.path.exists(path):
-        return None
+def load(path: str, *shape: int) -> np.ndarray:
     return np.fromfile(path, dtype="<f4").reshape(-1, *shape)
 
 
-def summary(port: np.ndarray, ref: np.ndarray) -> dict:
-    diff = port - ref
-    row_error = np.linalg.norm(diff.reshape(len(ref), -1), axis=1) / np.linalg.norm(
-        ref.reshape(len(ref), -1), axis=1
-    )
-    result = {
-        "rows": len(ref),
-        "rel_l2": float(np.linalg.norm(diff) / np.linalg.norm(ref)),
-        "max_abs": float(np.abs(diff).max()),
-        "row_rel_l2_p50_p90_max": [
-            round(float(x), 5) for x in np.percentile(row_error, [50, 90, 100])
-        ],
-        "worst_row": int(row_error.argmax()),
-    }
-    if ref.shape[-1] in (4096, 4097):
-        result["argmax_agreement"] = float((port.argmax(-1) == ref.argmax(-1)).mean())
-    return result
+def stats(values: np.ndarray) -> dict:
+    return {"min": float(values.min()), "mean": float(values.mean()), "max": float(values.max())}
 
 
-def compare(directory: str) -> dict:
-    with open(os.path.join(directory, "meta.json")) as f:
-        meta = json.load(f)
+def rel_l2(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    a, b = a.reshape(len(a), -1), b.reshape(len(b), -1)
+    return np.linalg.norm(a - b, axis=1) / np.linalg.norm(b, axis=1)
+
+
+class Source:
+    def __init__(self, spec: str, prompt_count: int, frame_count: int) -> None:
+        self.directory, self.kind = spec.rsplit(":", 1)
+        rows = slice(0, frame_count)
+        if self.kind == "port":
+            self.hidden = load(self.path("hidden_decode.f32"), 2048)[rows]
+            self.semantic = load(self.path("semantic.f32"), 4097)[rows]
+            self.residual = load(self.path("residual.f32"), 9, 4096)[rows]
+            self.router = None
+        elif self.kind in ("ref", "off"):
+            prefix = self.kind + "_"
+            hidden = load(self.path(prefix + "hidden.f32"), 2048)
+            self.hidden = hidden[prompt_count - 1 : prompt_count - 1 + frame_count]
+            self.semantic = load(self.path(prefix + "semantic.f32"), 4097)
+            self.residual = load(self.path(prefix + "residual.f32"), 9, 4096)
+            router_path = self.path(prefix + "router.i16")
+            self.router = (
+                np.fromfile(router_path, dtype="<i2").reshape(-1, len(hidden), 8)
+                if os.path.exists(router_path)
+                else None
+            )
+            meta_path = self.path(prefix + "meta.json")
+            with open(meta_path) as f:
+                self.near_ties = json.load(f).get("router_near_ties", [])
+        else:
+            raise ValueError(f"unknown kind {self.kind!r} in {spec!r}")
+
+    def path(self, name: str) -> str:
+        return os.path.join(self.directory, name)
+
+
+def case_meta(specs: list[str]) -> dict:
+    for spec in specs:
+        path = os.path.join(spec.rsplit(":", 1)[0], "meta.json")
+        if os.path.exists(path):
+            with open(path) as f:
+                return json.load(f)
+    raise FileNotFoundError("no meta.json in either directory")
+
+
+def compare(spec: str, baseline_spec: str) -> dict:
+    meta = case_meta([spec, baseline_spec])
     prompt_count, frame_count = len(meta["prompt_rows"]), len(meta["frames"])
-    ref_hidden = load(directory, "ref_hidden.f32", 2048)
-    if ref_hidden is None:
-        raise FileNotFoundError(f"{directory}: no ref_hidden.f32; run drama3_reference.py run first")
-    report: dict = {"case": directory, "prompt_rows": prompt_count, "frames": frame_count}
-    pairs = [
-        ("hidden_prefill.f32", ref_hidden, (2048,)),
-        ("hidden_decode.f32", ref_hidden[prompt_count - 1 :], (2048,)),
-        ("semantic.f32", load(directory, "ref_semantic.f32", 4097), (4097,)),
-        ("residual.f32", load(directory, "ref_residual.f32", 9, 4096), (9, 4096)),
-    ]
-    for name, ref, shape in pairs:
-        port = load(directory, name, *shape)
-        if port is None or ref is None:
-            continue
-        rows = min(len(port), len(ref))
-        report[name] = summary(port[:rows], ref[:rows])
-    meta_path = os.path.join(directory, "ref_meta.json")
-    if os.path.exists(meta_path):
-        with open(meta_path) as f:
-            report["router_near_ties"] = json.load(f).get("router_near_ties", [])[:3]
+    a = Source(spec, prompt_count, frame_count)
+    b = Source(baseline_spec, prompt_count, frame_count)
+
+    hidden_cosine = (a.hidden * b.hidden).sum(-1) / (
+        np.linalg.norm(a.hidden, axis=-1) * np.linalg.norm(b.hidden, axis=-1)
+    )
+    top10_a = np.argsort(-a.semantic, axis=-1)[:, :10]
+    top10_b = np.argsort(-b.semantic, axis=-1)[:, :10]
+    top10_overlap = np.mean(
+        [len(set(x) & set(y)) / 10 for x, y in zip(top10_a, top10_b)]
+    )
+    per_book = (a.residual.argmax(-1) == b.residual.argmax(-1)).mean(axis=0)
+    report = {
+        "compare": spec,
+        "baseline": baseline_spec,
+        "steps": frame_count,
+        "hidden_cosine": stats(hidden_cosine),
+        "hidden_rel_l2": stats(rel_l2(a.hidden, b.hidden)),
+        "semantic_top1_agreement": float(
+            (a.semantic.argmax(-1) == b.semantic.argmax(-1)).mean()
+        ),
+        "semantic_top10_overlap": float(top10_overlap),
+        "semantic_rel_l2": stats(rel_l2(a.semantic, b.semantic)),
+        "residual_top1_agreement_per_book": [round(float(x), 4) for x in per_book],
+        "residual_top1_agreement_min": float(per_book.min()),
+        "residual_rel_l2": stats(rel_l2(a.residual, b.residual)),
+    }
+    if a.router is not None and b.router is not None:
+        differs = (a.router != b.router).any(axis=-1)  # [layers, rows]
+        layers, rows = differs.nonzero()
+        flipped = set(zip(rows.tolist(), layers.tolist()))
+        report["router"] = {
+            "rows_with_a_different_expert_set": int(differs.any(axis=0).sum()),
+            "row_layer_pairs_different": int(differs.sum()),
+            "first_different": (
+                {"row": int(rows.min()), "layers": sorted(layers[rows == rows.min()].tolist())}
+                if len(rows)
+                else None
+            ),
+            "baseline_near_ties": [
+                {**tie, "flipped": (tie["row"], tie["layer"]) in flipped}
+                for tie in b.near_ties[:5]
+            ],
+        }
     return report
 
 
 if __name__ == "__main__":
-    for case_dir in sys.argv[1:]:
-        print(json.dumps(compare(case_dir), indent=2))
+    if len(sys.argv) != 3:
+        sys.exit(__doc__)
+    print(json.dumps(compare(sys.argv[1], sys.argv[2]), indent=2))

@@ -27,7 +27,10 @@ Sources read: sglang-omni `e0baa428`, sglang `b6778515`, transformers `637b76e4`
 
 - `drama3_reference.py`: the model and three commands.
   - `run <case_dir>`: reads `meta.json`, writes `ref_hidden.f32`, `ref_semantic.f32`,
-    `ref_residual.f32` and `ref_meta.json` into the same directory.
+    `ref_residual.f32`, `ref_router.i16` and `ref_meta.json` into the same directory.
+  - `run <case_dir> --emulate official`: the same outputs with an `off_` prefix,
+    computed with the official runtime's numerics instead of exactly (see
+    [Official-runtime emulation](#official-runtime-emulation)).
   - `check-steps <case_dir> [--rows N]`: one causal forward over the first N rows
     against a token-by-token decode (recurrent delta rule, conv window, KV caches), and
     the tower over all labelled rows at once against one row a step.
@@ -36,10 +39,12 @@ Sources read: sglang-omni `e0baa428`, sglang `b6778515`, transformers `637b76e4`
   the backbone into transformers' `Qwen3_5MoeTextModel` (experts dequantized to dense
   float32) and compares final-norm hidden states with `Backbone.forward`. An
   independent implementation of the backbone math; needs `transformers>=5`.
-- `compare_dump.py <case_dir>...`: compares a port's teacher-forced dump
-  (`hidden_prefill.f32`, `hidden_decode.f32`, `semantic.f32`, `residual.f32`) with the
-  `ref_*` files in the same directory (relative L2, per-row percentiles, argmax
-  agreement) and shows the closest router ties from `ref_meta.json`.
+- `compare_dump.py DIR:KIND BASELINE_DIR:KIND`: compares two sets of outputs per decode
+  step. KIND is `port` (the port's teacher dump: `hidden_decode.f32`, `semantic.f32`,
+  `residual.f32`), `ref` or `off`. It reports hidden cosine and relative L2, semantic
+  top-1 agreement, top-10 overlap and relative L2, and residual top-1 agreement per
+  book. For two router tables (`ref` / `off`) it also reports where the top-8 expert
+  sets differ and whether the baseline's closest ties flipped.
 - `make_case.py`: writes a synthetic `meta.json` from the official `build_prompt_rows`
   plus random valid frames, and prints the rows and the detokenized prompt.
 
@@ -59,6 +64,8 @@ Outputs are little-endian float32 in C order, with P prompt rows and F frames:
   `[eos, semantic_begin + 0 .. semantic_begin + 4095]`.
 - `ref_residual.f32` `[F, 9, 4096]`: raw logits of codebook `r+1` at decode step `t`,
   teacher-forced with codebooks `0..r` of `frames[t]`.
+- `ref_router.i16` `[40, P+F, 8]` (int16): the experts each row selected in each layer,
+  ascending.
 
 ## How the tower is driven
 
@@ -91,6 +98,32 @@ slower but does not stop it. `peak_rss_gib` in `ref_meta.json` counts mapped sha
 too (about 30-37 GiB on the long cases); most of that is clean, reclaimable page cache.
 The tower keeps its float32 weights (about 4 GiB) because it runs once per frame.
 
+## Official-runtime emulation
+
+`--emulate official` estimates how far the official sglang runtime is from the exact
+math, as a yardstick for a port's error. It still computes in float32, but rounds to
+BF16 wherever sglang stores a BF16 tensor, and quantizes the routed experts'
+activations as sglang's `Fp8MoEMethod` does. These are the storage points, read from
+sglang `b6778515` and sglang-omni `e0baa428`:
+
+| Part | Official numerics emulated |
+|---|---|
+| Linear layers | BF16 inputs and weights, float32 accumulation, BF16 output |
+| Norms | `gemma_fused_add_rmsnorm`: the norm reads the float32 sum, the residual is stored BF16, the output is BF16 |
+| Full attention | `fused_qk_gemma_rmsnorm_rope_gate`: q/k normed then stored BF16, rotated in float32 with a float32 table, stored BF16. Prefill is flash-attention style (unnormalized probabilities rounded to BF16 before P·V); decode uses an exact softmax. The KV cache is BF16; `sigmoid(gate)·o` is stored BF16 |
+| Gated DeltaNet prefill | conv and SiLU output BF16; `l2norm_fwd` q/k BF16; beta BF16 (`fused_gdn_gating`), g float32; FLA chunk kernels: (I+A)⁻¹, w, u, the per-chunk state h, v_new and the masked qkᵀ stored BF16; recurrent state float32 (`mamba_ssm_dtype`) |
+| Gated DeltaNet decode | float32 recurrent kernel (q/k L2 norm and beta in float32), output BF16 |
+| MoE | BF16 router logits, float32 softmax and top-k; per-token-group (128) dynamic FP8 E4M3 activation quantization (`scale = max(amax, 1e-10) / 448`, round to nearest even) before the gate/up and down GEMMs; BF16 gate/up and `silu_and_mul`; routing weight in float32, BF16 per-expert output, float32 top-k sum stored BF16; BF16 shared expert and its gate |
+| Schedule | backbone: extend over the prompt, then one decode forward per frame; tower: prefill over the prompt, then one step per frame |
+| Embedding, heads | BF16 `embed_backbone` arithmetic; BF16 lm_head and codebook-head logits |
+| Tower | the same storage points, following the unfused `DecoderLayer` |
+
+Not emulated: GEMM accumulation order and split-K, tf32 in FLA's solve on some GPUs,
+the exact rounding points of the fused tower decode kernels, and DeepGEMM's UE8M0
+(power-of-two) activation scales. The checks are `check-gdn`, where the BF16-storage
+chunked rule lands at 0.46% relative L2 from the float32 recurrence (BF16 level), and
+the bit-identity of the default path, which this mode leaves untouched.
+
 ## Choices where the sources leave room
 
 - Rotary angles are formed in float64 (`position * base^(-2i/d)`) and then cast. The
@@ -119,4 +152,5 @@ The tower keeps its float32 weights (about 4 GiB) because it runs once per frame
 | `check-steps`, 150 rows of `en_short` | identical to 7e-7 up to row 108; at row 109 layer 20 `log(p8/p9)` is 4e-7 with the 8th expert at 12% weight, the stepwise path picks the other expert, and rows after that differ by 0.4-9% |
 | `run --dtype float64` vs float32, `en_short` | hidden rel-L2 5.3e-7 (worst row 2e-6); semantic 3.2e-7, residual 5.2e-7; argmax identical |
 | `run` after the cleanup pass | outputs bit-identical to the run before it |
+| `run` after adding `--emulate official` (en_short, en_clone, ja_long) | `ref_*` outputs bit-identical to the run before it |
 | `make_case.py` | detokenized rows reproduce the `reference-bracket-v1` template; text rows carry zero codes; reference rows are `[semantic_begin + c0, c0..c9]` |
