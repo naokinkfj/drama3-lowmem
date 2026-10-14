@@ -35,6 +35,20 @@ struct Drama3TowerOutput {
     std::vector<float> logits;
 };
 
+struct Drama3TowerSampling {
+    float temperature = 1.0F;
+    int top_k = 30;
+    float top_p = 0.9F;
+};
+
+// One generation step through every tower layer, drawing the nine residual
+// codebooks on the device. `codes` are codebooks 1..9; `logits` (residual
+// layers x codebook_size) is filled only when requested.
+struct Drama3TowerStep {
+    std::vector<int32_t> codes;
+    std::vector<float> logits;
+};
+
 // Each tower layer attends over the speech timeline, including prompt rows.
 // Its cache is independent of the backbone and persists across codebooks.
 class Drama3Tower {
@@ -56,6 +70,12 @@ public:
                               const std::vector<float> & semantic_mask,
                               const std::vector<float> & extra_input,
                               int64_t position, int64_t steps = 1);
+    // uniforms: one draw in [0, 1) per residual codebook. forced (optional,
+    // nine codes) replaces the draws, for teacher-forced validation.
+    Drama3TowerStep run_step(const std::vector<float> & hidden, int32_t first_code,
+                             const std::vector<float> & extra_input, int64_t position,
+                             const std::vector<float> & uniforms, const std::vector<int32_t> * forced,
+                             const Drama3TowerSampling & sampling, bool want_logits);
     const Drama3TowerConfig & config() const noexcept;
 
 private:

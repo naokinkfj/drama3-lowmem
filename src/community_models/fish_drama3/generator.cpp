@@ -245,20 +245,18 @@ Drama3Generation Drama3Generator::generate(const std::string & text, const std::
         next[0] = assets_->tower.semantic_begin + selected - 1;
         next[1] = selected - 1;
         const auto shared_input = tower_->shared_input({current});
-        auto tower_hidden = hidden;
         const int64_t position = decoder->valid_steps() - 1;
         const auto & config = assets_->tower;
-        for (int64_t layer = 0; layer < config.shared_layers + config.residual_layers; ++layer) {
-            const int64_t book = layer < config.shared_layers ? 0 : layer - config.shared_layers;
-            const auto tower_output = tower_->run_layer(layer, tower_hidden, {next[1 + book]}, {1.0F},
-                                                        layer == 0 ? shared_input : std::vector<float>{}, position);
-            tower_hidden = tower_output.hidden;
-            if (layer >= config.shared_layers) {
-                next[2 + book] = sample(tower_output.logits, sampling.temperature, sampling.top_k, sampling.top_p, random);
-                if (!teacher.empty()) next[2 + book] = teacher[static_cast<size_t>(step)][2 + book];
-                if (dumping) dump_residual.insert(dump_residual.end(), tower_output.logits.begin(), tower_output.logits.end());
-            }
-        }
+        std::vector<float> uniforms(static_cast<size_t>(config.residual_layers));
+        // generate_canonical can round up to 1.0; keep draws in [0, 1).
+        for (auto & value : uniforms) value = std::min(std::generate_canonical<float, 24>(random), 0.99999994F);
+        std::vector<int32_t> forced;
+        if (!teacher.empty()) forced.assign(teacher[static_cast<size_t>(step)].begin() + 2, teacher[static_cast<size_t>(step)].end());
+        const auto drawn = tower_->run_step(hidden, next[1], shared_input, position, uniforms,
+                                            teacher.empty() ? nullptr : &forced,
+                                            {sampling.temperature, sampling.top_k, sampling.top_p}, dumping);
+        std::copy(drawn.codes.begin(), drawn.codes.end(), next.begin() + 2);
+        if (dumping) dump_residual.insert(dump_residual.end(), drawn.logits.begin(), drawn.logits.end());
         output_frames.push_back(next);
         split(tower_ms);
         if (step == 0) mark_phase("tower_first_frame_ms");

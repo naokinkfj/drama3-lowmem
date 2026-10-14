@@ -1,5 +1,7 @@
 #include "engine/community_models/fish_drama3/tower.h"
 
+#include "engine/community_models/fish_drama3/sampler_graph.h"
+
 #include "engine/framework/core/backend.h"
 #include "engine/framework/core/backend_weight_store.h"
 
@@ -55,6 +57,13 @@ struct LayerGraph {
     ggml_tensor * output = nullptr;
     ggml_tensor * logits = nullptr;
     std::vector<ggml_tensor *> book_codes;
+    // Fused step graph only.
+    ggml_tensor * uniforms = nullptr;
+    ggml_tensor * forced = nullptr;
+    ggml_tensor * force_mask = nullptr;
+    ggml_tensor * first_only = nullptr;
+    ggml_tensor * drawn = nullptr;
+    Drama3TowerSampling sampling;
     ggml_backend_t backend = nullptr;
 
     ~LayerGraph() {
@@ -166,6 +175,7 @@ public:
     ~Impl() {
         prefill_graphs_.clear();
         graphs_.clear();
+        step_graph_.reset();
         if (cache_buffer_) ggml_backend_buffer_free(cache_buffer_);
     }
 
@@ -289,9 +299,123 @@ public:
         return result;
     }
 
+    Drama3TowerStep run_step(const std::vector<float> & hidden, int32_t first_code, const std::vector<float> & extra,
+                             int64_t position, const std::vector<float> & uniforms, const std::vector<int32_t> * forced,
+                             const Drama3TowerSampling & sampling, bool want_logits) {
+        const auto & c = config_;
+        if (hidden.size() != static_cast<size_t>(c.hidden_size) || extra.size() != hidden.size() ||
+            uniforms.size() != static_cast<size_t>(c.residual_layers) || position < 0 || position >= capacity_ ||
+            first_code < 0 || first_code >= c.codebook_size ||
+            (forced && forced->size() != static_cast<size_t>(c.residual_layers))) {
+            throw std::runtime_error("invalid Drama 3 tower step input");
+        }
+        if (!step_graph_ || step_graph_->sampling.temperature != sampling.temperature ||
+            step_graph_->sampling.top_k != sampling.top_k || step_graph_->sampling.top_p != sampling.top_p) {
+            step_graph_ = build_step_graph(sampling);
+        }
+        auto * graph = step_graph_.get();
+        const float one = 1.0F;
+        const auto position32 = static_cast<int32_t>(position);
+        ggml_backend_tensor_set(graph->hidden, hidden.data(), 0, hidden.size() * sizeof(float));
+        ggml_backend_tensor_set(graph->extra, extra.data(), 0, extra.size() * sizeof(float));
+        ggml_backend_tensor_set(graph->codes, &first_code, 0, sizeof(int32_t));
+        ggml_backend_tensor_set(graph->label_mask, &one, 0, sizeof(float));
+        ggml_backend_tensor_set(graph->positions, &position32, 0, sizeof(int32_t));
+        ggml_backend_tensor_set(graph->uniforms, uniforms.data(), 0, uniforms.size() * sizeof(float));
+        std::vector<float> forced_values(static_cast<size_t>(c.residual_layers), 0.0F);
+        std::vector<float> mask(static_cast<size_t>(c.residual_layers), forced ? 1.0F : 0.0F);
+        if (forced) {
+            for (size_t i = 0; i < forced->size(); ++i) {
+                if ((*forced)[i] < 0 || (*forced)[i] >= c.codebook_size) throw std::runtime_error("Drama 3 code is outside the codebook");
+                forced_values[i] = static_cast<float>((*forced)[i]);
+            }
+        }
+        ggml_backend_tensor_set(graph->forced, forced_values.data(), 0, forced_values.size() * sizeof(float));
+        ggml_backend_tensor_set(graph->force_mask, mask.data(), 0, mask.size() * sizeof(float));
+        std::vector<float> first_only(static_cast<size_t>(graph->first_only->ne[0]), 0.0F);
+        first_only[0] = 1.0F;
+        ggml_backend_tensor_set(graph->first_only, first_only.data(), 0, first_only.size() * sizeof(float));
+        std::vector<ggml_fp16_t> attention_mask(static_cast<size_t>(capacity_));
+        const auto negative_infinity = ggml_fp32_to_fp16(-std::numeric_limits<float>::infinity());
+        for (int64_t key = 0; key < capacity_; ++key) attention_mask[key] = key <= position ? ggml_fp32_to_fp16(0) : negative_infinity;
+        ggml_backend_tensor_set(graph->attention_mask, attention_mask.data(), 0, attention_mask.size() * sizeof(ggml_fp16_t));
+        if (core::compute_backend_graph(execution_.backend(), graph->graph, nullptr, "drama3.tower.step") != GGML_STATUS_SUCCESS) {
+            throw std::runtime_error("Drama 3 tower step computation failed");
+        }
+        Drama3TowerStep result;
+        const auto drawn = core::read_tensor_f32(graph->drawn);
+        for (float code : drawn) result.codes.push_back(static_cast<int32_t>(code));
+        if (want_logits) result.logits = core::read_tensor_f32(graph->logits);
+        return result;
+    }
+
     Drama3TowerConfig config_;
 
 private:
+    // Every tower layer for one step, with the residual codebooks drawn on the
+    // device so the step needs a single graph launch and one small readback.
+    std::unique_ptr<LayerGraph> build_step_graph(const Drama3TowerSampling & sampling) {
+        const auto & c = config_;
+        auto result = std::make_unique<LayerGraph>();
+        result->backend = execution_.backend();
+        result->sampling = sampling;
+        ggml_init_params params{16 * 1024 * 1024, nullptr, true};
+        result->context.reset(ggml_init(params));
+        auto * ctx = result->context.get();
+        result->graph = ggml_new_graph_custom(ctx, 16384, false);
+        const auto input = [&](ggml_type type, int64_t columns, int64_t rows) {
+            auto * tensor = ggml_new_tensor_2d(ctx, type, columns, rows);
+            ggml_set_input(tensor);
+            return tensor;
+        };
+        result->hidden = input(GGML_TYPE_F32, c.hidden_size, 1);
+        result->extra = input(GGML_TYPE_F32, c.hidden_size, 1);
+        result->codes = input(GGML_TYPE_I32, 1, 1);
+        result->label_mask = input(GGML_TYPE_F32, 1, 1);
+        result->positions = input(GGML_TYPE_I32, 1, 1);
+        result->attention_mask = input(GGML_TYPE_F16, capacity_, 1);
+        result->uniforms = input(GGML_TYPE_F32, c.residual_layers, 1);
+        result->forced = input(GGML_TYPE_F32, c.residual_layers, 1);
+        result->force_mask = input(GGML_TYPE_F32, c.residual_layers, 1);
+        result->first_only = input(GGML_TYPE_F32, std::max(1, sampling.top_k), 1);
+        auto * hidden = result->hidden;
+        auto * code = ggml_reshape_1d(ctx, result->codes, 1);
+        for (int64_t layer = 0; layer < c.shared_layers; ++layer) {
+            hidden = build_layer(ctx, layer, 1, hidden, code, result->label_mask,
+                layer == 0 ? result->extra : nullptr, result->positions, result->attention_mask);
+        }
+        ggml_tensor * drawn = nullptr;
+        ggml_tensor * logits = nullptr;
+        const auto element = [&](ggml_tensor * vector, int64_t index) {
+            return ggml_view_1d(ctx, vector, 1, static_cast<size_t>(index) * ggml_element_size(vector));
+        };
+        for (int64_t book = 0; book < c.residual_layers; ++book) {
+            const int64_t layer = c.shared_layers + book;
+            hidden = build_layer(ctx, layer, 1, hidden, code, result->label_mask, nullptr,
+                result->positions, result->attention_mask);
+            auto * head = ggml_mul_mat(ctx, layers_[layer].head, hidden);
+            auto * sampled = build_drama3_sampler(ctx, head, element(result->uniforms, book), result->first_only,
+                sampling.temperature, sampling.top_k, sampling.top_p);
+            auto * mask = element(result->force_mask, book);
+            auto * chosen = ggml_add(ctx, ggml_mul(ctx, sampled, ggml_scale_bias(ctx, mask, -1.0F, 1.0F)),
+                                     ggml_mul(ctx, element(result->forced, book), mask));
+            drawn = drawn ? ggml_concat(ctx, drawn, chosen, 0) : chosen;
+            logits = logits ? ggml_concat(ctx, logits, head, 1) : head;
+            code = ggml_cast(ctx, chosen, GGML_TYPE_I32);
+        }
+        result->drawn = drawn;
+        result->logits = logits;
+        ggml_set_output(drawn);
+        ggml_set_output(logits);
+        ggml_build_forward_expand(result->graph, drawn);
+        ggml_build_forward_expand(result->graph, logits);
+        result->allocator = ggml_gallocr_new(ggml_backend_get_default_buffer_type(execution_.backend()));
+        if (!result->allocator || !ggml_gallocr_alloc_graph(result->allocator, result->graph)) {
+            throw std::runtime_error("failed to allocate Drama 3 tower step graph");
+        }
+        return result;
+    }
+
     struct PrefillGraphs {
         int64_t steps;
         size_t bytes = 0;
@@ -458,6 +582,7 @@ private:
     std::unique_ptr<ggml_context, ContextDeleter> cache_context_;
     ggml_backend_buffer_t cache_buffer_ = nullptr;
     std::vector<std::unique_ptr<LayerGraph>> graphs_;
+    std::unique_ptr<LayerGraph> step_graph_;
     size_t prefill_cache_budget_;
     size_t prefill_cached_bytes_ = 0;
     std::list<PrefillGraphs> prefill_graphs_;
@@ -478,6 +603,12 @@ Drama3TowerOutput Drama3Tower::run_layer(int64_t layer, const std::vector<float>
                                         const std::vector<int32_t> & codes, const std::vector<float> & semantic_mask,
                                         const std::vector<float> & extra_input, int64_t position, int64_t steps) {
     return impl_->run_layer(layer, hidden, codes, semantic_mask, extra_input, position, steps);
+}
+Drama3TowerStep Drama3Tower::run_step(const std::vector<float> & hidden, int32_t first_code,
+                                      const std::vector<float> & extra_input, int64_t position,
+                                      const std::vector<float> & uniforms, const std::vector<int32_t> * forced,
+                                      const Drama3TowerSampling & sampling, bool want_logits) {
+    return impl_->run_step(hidden, first_code, extra_input, position, uniforms, forced, sampling, want_logits);
 }
 const Drama3TowerConfig & Drama3Tower::config() const noexcept { return impl_->config_; }
 

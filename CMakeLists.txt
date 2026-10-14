@@ -1445,6 +1445,7 @@ audiocpp_add_model(fish_drama3
         src/community_models/fish_drama3/prompt.cpp
         src/community_models/fish_drama3/session.cpp
         src/community_models/fish_drama3/tower.cpp
+        src/community_models/fish_drama3/sampler_graph.cpp
     INCLUDES
         engine/community_models/fish_drama3/loader.h
     LOADERS
