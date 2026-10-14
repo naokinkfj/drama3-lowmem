@@ -57,6 +57,10 @@ Drama3Generator::Drama3Generator(std::shared_ptr<const Drama3Assets> assets,
     auto backbone_config = assets_->backbone;
     backbone_config.decode_cache_steps = cache_steps_;
     backbone_config.cpu_expert_layers = runtime::parse_i64_option(options.options, {"fish_drama3.cpu_expert_layers"}).value_or(4);
+    if (const auto value = runtime::find_option(options.options, {"fish_drama3.offline_codec"})) {
+        if (*value == "full") offline_codec_stream_ = false;
+        else if (*value != "stream") throw std::runtime_error("fish_drama3.offline_codec requires stream or full");
+    }
     const auto backbone_prefill_cache_mb = runtime::parse_i64_option(options.options, {"fish_drama3.backbone_prefill_cache_mb"}).value_or(256);
     if (backbone_prefill_cache_mb < 0 || backbone_prefill_cache_mb > 4096) throw std::runtime_error("Drama 3 backbone_prefill_cache_mb must be between 0 and 4096");
     backbone_config.prefill_cache_bytes = static_cast<size_t>(backbone_prefill_cache_mb) * 1024u * 1024u;
@@ -224,7 +228,20 @@ Drama3Generation Drama3Generator::generate(const std::string & text, const std::
     for (int64_t book = 0; book < 10; ++book) {
         for (size_t row = 0; row < output_frames.size(); ++row) result.codes.codes[book * output_frames.size() + row] = output_frames[row][book + 1];
     }
-    if (!streaming) {
+    if (!streaming && offline_codec_stream_) {
+        // drama3-lowmem: decode through the causal streaming graph one frame at
+        // a time. Its memory does not grow with the take, whereas the
+        // whole-take graph needed about 8 GiB of VRAM for a 30 s take.
+        codec_->reset_decode_stream();
+        for (const auto & frame : output_frames) {
+            codecs::FishDacCodes codes;
+            codes.codebooks = 10;
+            codes.frames = 1;
+            codes.codes.assign(frame.begin() + 1, frame.end());
+            runtime::append_audio_buffer(result.audio, codec_->decode_stream(codes));
+        }
+        codec_->reset_decode_stream();
+    } else if (!streaming) {
         result.audio = codec_->decode_codes(result.codes);
         codec_->release_runtime_graphs();
     }

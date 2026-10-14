@@ -37,6 +37,7 @@ private:
     fish_audio::FishAudioTextTokenizer tokenizer_;
     int64_t cache_steps_;
     bool profile_first_audio_ = false;
+    bool offline_codec_stream_ = true;
     std::unique_ptr<Drama3BackboneDecoderRuntime> backbone_;
     std::unique_ptr<Drama3Tower> tower_;
     std::unique_ptr<core::ExecutionContext> codec_execution_;

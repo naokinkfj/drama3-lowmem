@@ -184,6 +184,17 @@
           "cpu"
         ],
         "default": "same"
+      },
+      {
+        "name": "offline_codec",
+        "type": "enum",
+        "description": "Offline codec decode: stream decodes frame by frame with constant memory; full builds one graph for the whole take (about 8 GiB of VRAM for 30 s).",
+        "required": false,
+        "values": [
+          "stream",
+          "full"
+        ],
+        "default": "stream"
       }
     ],
     "load": []
