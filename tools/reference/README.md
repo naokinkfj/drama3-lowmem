@@ -82,7 +82,7 @@ the two are the same.
 ## Running
 
 ```
-PY=python3
+PY=python3  # any environment with torch, numpy and safetensors
 $PY make_case.py --official-prompt <sglang-omni>/sglang_omni/models/fishaudio_drama3/prompt.py \
     --out cases/smoke_en --frames 8
 $PY drama3_reference.py --threads 8 run cases/smoke_en
