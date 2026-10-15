@@ -27,6 +27,7 @@ layers in RAM:
 | Package size | 42.0 GB (the official checkpoint is 41.5 GB) |
 | Accuracy vs. an FP32 reference | hidden-state error 2.0-3.9 %, top-1 agreement 94.4-98.9 % (the official runtime's numerics: 3.6-4.6 %, 87.6-97.0 %) |
 | Robustness, 8 seeds each | Japanese paragraph 8/8, two-speaker dialogue 8/8, English paragraph 8/8 |
+| Smaller GPUs (emulated on the 5090, not tested on real cards) | 24 GB: RTF 0.49-0.55 with 22 GB RAM; 16 GB: 0.60-0.68 with 30 GB RAM (8 seeds x 3 texts all complete); 12 GB: 0.66-0.76 with 34 GB RAM. 16 GB and 12 GB cards need about 48 GB of system RAM |
 
 ## How it works
 
@@ -34,7 +35,9 @@ layers in RAM:
   unchanged with one FP32 scale per 128 values, with AVX-512 (CPU) and CUDA
   kernels. Decoding is bit-exact.
 - **Expert placement:** the first `cpu_expert_layers` layers keep their experts in
-  RAM; only about 8 KB of activations per layer cross PCIe.
+  RAM; only about 8 KB of activations per layer cross PCIe. By default (`auto`)
+  the number is chosen from the free GPU memory at startup, and
+  `vram_budget_gb` caps it.
 - **Per-frame work is trimmed:** the LM head computes only the audio-code rows,
   the 13-layer audio tower and its sampling run as one GPU graph, and codec
   decoding overlaps generation on a background thread.
@@ -65,7 +68,6 @@ venv/bin/python tools/community_models/convert_fish_drama3.py \
 # 3. Generate
 build/linux-cuda-release/bin/audiocpp_cli --task tts --family fish_drama3 --backend cuda \
   --model models/drama3-fp8.gguf --threads 16 \
-  --session-option fish_drama3.cpu_expert_layers=9 \
   --text '<|speaker:0|>Hello there.<|speaker:1|>Hi! Nice to meet you.' --out out.wav
 ```
 
@@ -76,9 +78,6 @@ Only clone voices you have permission to use.
 
 - [docs/drama3-lowmem.md](docs/drama3-lowmem.md): how it works, results, accuracy,
   options, memory guide and licenses
-- [docs/report/index.html](docs/report/index.html): a work report for non-specialist
-  readers, with audio samples (Japanese)
-- [docs/PLAN.md](docs/PLAN.md): plan and progress log (Japanese)
 - [tools/reference/README.md](tools/reference/README.md): the FP32 reference used for
   accuracy checks
 - [UPSTREAM_README.md](UPSTREAM_README.md): the README of audio.cpp, which this

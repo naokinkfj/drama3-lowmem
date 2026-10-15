@@ -27,6 +27,7 @@ RTX 5090（32GB）、Ryzen 9 9950X3D、59GiB RAM の環境で、40 層ある exp
 | モデルパッケージの大きさ | 42.0GB（公式は 41.5GB） |
 | FP32 基準実装との差 | 内部状態の誤差 2.0〜3.9%、次のトークンの 1 位一致率 94.4〜98.9%（公式の計算方式では 3.6〜4.6%、87.6〜97.0%） |
 | 安定性（乱数を変えて 8 回ずつ） | 日本語の長文 8/8、2 人の会話 8/8、英語の長文 8/8 |
+| 小さい GPU（5090 上で再現。実機では未確認） | 24GB: RTF 0.49〜0.55、メインメモリ 22GB。16GB: 0.60〜0.68、30GB（8 回 × 3 種すべて完走）。12GB: 0.66〜0.76、34GB。16GB・12GB の GPU にはメインメモリ 48GB 以上が必要 |
 
 ## しくみ
 
@@ -34,7 +35,8 @@ RTX 5090（32GB）、Ryzen 9 9950X3D、59GiB RAM の環境で、40 層ある exp
   そのまま保ち、128 個ごとに FP32 の倍率を 1 つ持たせます。CPU（AVX-512）用と
   CUDA 用の計算処理を書きました。元の値への復元はビット単位で正確です。
 - **expert の置き場所:** 先頭の `cpu_expert_layers` 層の expert をメインメモリに
-  置きます。PCIe を通るのは 1 層あたり約 8KB の中間値だけです。
+  置きます。PCIe を通るのは 1 層あたり約 8KB の中間値だけです。既定（`auto`）では
+  起動時の空き VRAM から層数を自動で決め、`vram_budget_gb` で上限を指定できます。
 - **1 フレームごとの処理を削減:** LM head は音声コードの行だけを計算します。13 層の
   audio tower とサンプリングは 1 つの GPU グラフにまとめ、音声への変換（codec）は
   別スレッドで生成と並行して行います。
@@ -42,9 +44,7 @@ RTX 5090（32GB）、Ryzen 9 9950X3D、59GiB RAM の環境で、40 層ある exp
   生成し、無音のまま止まった場合や途中で終わった場合は作り直します。
 
 詳しい説明、測定結果、小さい GPU 向けのメモリの目安は
-[docs/drama3-lowmem.md](docs/drama3-lowmem.md)（英語）にあります。予備知識のない人
-向けの作業報告書は [docs/report/index.html](docs/report/index.html)（音声サンプル付き）
-です。
+[docs/drama3-lowmem.md](docs/drama3-lowmem.md)（英語）にあります。
 
 ## 使い方（Linux + NVIDIA）
 
@@ -67,7 +67,6 @@ venv/bin/python tools/community_models/convert_fish_drama3.py \
 # 3. 音声を生成
 build/linux-cuda-release/bin/audiocpp_cli --task tts --family fish_drama3 --backend cuda \
   --model models/drama3-fp8.gguf --threads 16 \
-  --session-option fish_drama3.cpu_expert_layers=9 \
   --text '<|speaker:0|>こんにちは。<|speaker:1|>はじめまして、よろしくお願いします。' --out out.wav
 ```
 
@@ -78,9 +77,6 @@ build/linux-cuda-release/bin/audiocpp_cli --task tts --family fish_drama3 --back
 
 - [docs/drama3-lowmem.md](docs/drama3-lowmem.md): しくみ、結果、精度、オプション、
   メモリの目安、ライセンス（英語）
-- [docs/report/index.html](docs/report/index.html): 予備知識のない人向けの作業報告書
-  （音声サンプル付き）
-- [docs/PLAN.md](docs/PLAN.md): 計画と進捗の記録
 - [tools/reference/README.md](tools/reference/README.md): 精度確認に使った FP32 基準実装
   （英語）
 - [UPSTREAM_README.md](UPSTREAM_README.md): 土台にした audio.cpp の README（英語）

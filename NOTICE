@@ -42,11 +42,13 @@ Relative to commit 4dbb4d12:
 - The fish_drama3 port: candidate-only LM head, host-side token embedding, a
   fused audio-tower step with on-device sampling, background codec decoding,
   CPU reference encoding, sentence and speaker-turn chunking, stall and
-  early-end detection with retries, and teacher-forced dumps. Modified:
+  early-end detection with retries and per-chunk final-state logging, automatic
+  expert placement from the free GPU memory, and teacher-forced dumps. Modified:
   include/engine/community_models/fish_drama3/{backbone,generator,tower}.h,
   src/community_models/fish_drama3/{backbone,generator,session,tower}.cpp,
   model_specs/fish_drama3.json, CMakeLists.txt. New:
-  {include/engine,src}/community_models/fish_drama3/{sampler_graph,text_chunks}.
+  {include/engine,src}/community_models/fish_drama3/{sampler_graph,text_chunks,
+  memory_plan}.
 - The checkpoint converter keeps the official FP8 expert bytes unchanged:
   tools/community_models/convert_fish_drama3.py.
 - New tests (tests/fp8, tests/drama3), validation tools
@@ -106,10 +108,3 @@ Vendored under external/, each under its own license:
 Other model families that audio.cpp supports keep the licenses of their
 original releases; see docs/model_licenses.md.
 
-
-Audio in docs/report
---------------------
-
-- The English reference voice is clip common_voice_en_10119832 from Mozilla
-  Common Voice (CC0 1.0), the same clip the Drama 3 model card uses.
-- All other audio was generated with Fish Audio Drama 3 by this project.

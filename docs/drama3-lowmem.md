@@ -26,11 +26,12 @@ re-quantization, no calibration, no pruning.
 
 ## How it fits
 
-Each of the 40 MoE layers holds 256 experts (about 0.83 GB per layer in FP8), but a
+Each of the 40 MoE layers holds 256 experts (792 MiB per layer in FP8), but a
 token only uses 8 of them. The first `cpu_expert_layers` layers keep their experts
-in system RAM and compute them on the CPU; everything else (attention, shared
-experts, routers, the remaining expert layers, the audio tower, the codec) runs on
-the GPU. Per CPU layer only the layer's activations (about 8 KB) cross PCIe;
+in system RAM and compute them on the CPU (by default as many as the free GPU
+memory requires, see [Choosing the expert placement](#choosing-the-expert-placement));
+everything else (attention, shared experts, routers, the remaining expert layers,
+the audio tower, the codec) runs on the GPU. Per CPU layer only the layer's activations (about 8 KB) cross PCIe;
 weights never move.
 
 On the CPU the FP8 dot product is an AVX-512 kernel that streams the expert bytes
@@ -46,13 +47,15 @@ time divided by audio length (lower is faster; 1.0 is real time).
 | Package | CPU expert layers | RTF (EN short / JA short / JA long / dialogue) | Peak VRAM |
 |---|---|---|---|
 | FP8, unquantized (this project) | 9 | 0.36 / 0.30 / 0.31 / 0.34 | 31.9 GB |
-| FP8, unquantized (this project) | 12 | 0.36 / 0.33 / - / - | 29.1 GB |
+| FP8, unquantized (this project) | 12 (`auto`) | 0.36 / 0.33 / 0.35 / 0.37 | 29.1 GB |
 | F16-expanded experts (first attempt) | 26 | 1.25-2.2 | 30.1 GB |
 | Community Q4_K_S (for comparison, quantized) | 0 | 0.27 | 23.7 GB |
 
 Per frame at 9 CPU layers: backbone about 10 ms, audio tower 2.8 ms, sampling
 0.4 ms; codec decoding overlaps with generation on a background thread. The
-process uses about 10 GB of system RAM at 9 CPU layers.
+process uses about 10 GB of system RAM at 9 CPU layers. 9 layers fits these
+short prompts only: a voice-cloning prompt that fills a 4096-step context needs
+about 1.6 GB more and would not fit, which is why `auto` picks 12.
 
 Voice cloning: the first request with a new reference also encodes it on the
 CPU (about 1 s for a 4 s clip, 7 s for a 25 s clip), so a 3.4 s clone took RTF
@@ -92,7 +95,9 @@ drama3-lowmem therefore:
 - generates each `<|speaker:N|>` turn as its own chunk (`split_speaker_turns`);
 - stops a take that repeats one frame `stall_frames` (64, about 3 s) times, or
   that is far shorter than its text (`min_seconds_per_char`, 0.02), and
-  regenerates it with another seed (`stall_retries`, 2).
+  regenerates it with another seed (`stall_retries`, 2), and logs each chunk's
+  final state (`[fish_drama3] chunk N final: ok`, or `stalled` / `ended early`
+  when the retries did not help; `failed_chunks` in the result counts them).
 
 Over 8 seeds each (Whisper character error rate < 0.15 counts as complete):
 
@@ -125,36 +130,75 @@ venv/bin/python tools/community_models/convert_fish_drama3.py \
 # 3. Generate
 build/linux-cuda-release/bin/audiocpp_cli --task tts --family fish_drama3 --backend cuda \
   --model models/drama3-fp8.gguf --threads 16 \
-  --session-option fish_drama3.cpu_expert_layers=9 \
   --text '<|speaker:0|>Hello there.<|speaker:1|>Hi! Nice to meet you.' --out out.wav
 ```
 
 Add `--voice-ref ref.wav --request-option 'reference_text=...'` to clone a voice.
+The expert placement is chosen from the free GPU memory at startup; add
+`--session-option fish_drama3.vram_budget_gb=24` to use less (for example to leave
+room for a desktop), or `--session-option fish_drama3.cpu_expert_layers=12` to fix it.
 
-## Choosing `cpu_expert_layers`
+`audiocpp_server` serves the same model over HTTP with a browser UI; a config with
+`"mode": "offline"` keeps the quality guards (streaming mode cannot regenerate a
+take that has already been sent).
 
-The GPU needs about 6 GB for everything except the GPU-resident expert layers, plus
-about 0.83 GB per expert layer it keeps. System RAM needs about 0.83 GB per
-CPU-resident layer plus about 3 GB.
+## Choosing the expert placement
 
-| GPU VRAM | `cpu_expert_layers` | System RAM needed | Expected RTF |
-|---|---|---|---|
-| 32 GB (headless) | 9 | ~10 GB | 0.3 (measured) |
-| 32 GB (with a desktop) | 10-12 | ~12 GB | 0.31-0.36 (measured) |
-| 24 GB | ~19 | ~19 GB | ~0.4-0.5 (estimate) |
-| 16 GB | ~29 | ~27 GB | ~0.6-0.8 (estimate) |
-| 12 GB | ~34 | ~31 GB | ~0.8-1.0 (estimate) |
+`fish_drama3.cpu_expert_layers` defaults to `auto`: at startup it reads the free
+GPU memory and keeps the fewest leading expert layers in system RAM that let the
+rest fit, logging the choice:
 
-Only the 32 GB rows were measured. Estimates scale the measured per-layer cost
-(about 0.5 ms per CPU layer per frame on DDR5) and assume a GPU at least as
-capable as the expert kernels need; slower GPUs and RAM will be slower. Use 16 CPU
+```
+[fish_drama3] cpu_expert_layers=auto -> 12 (VRAM budget 30.9 GiB, estimated GPU peak 30.8 GiB, system RAM 14.5 GiB, context_length 4096)
+```
+
+The estimate adds the per-layer expert sizes read from the package (a package
+can mix FP8 and F16 layers), the other weights, the decode caches and the
+prefill graph of a prompt that fills the whole `context_length`, the prefill
+cache budgets and a 768 MiB margin. It is conservative for short prompts on
+purpose: a long voice-cloning prompt can otherwise run out of GPU memory in the
+middle of a request. `fish_drama3.vram_budget_gb` caps the budget below the
+free memory; an integer `cpu_expert_layers` skips the estimate. If even all-CPU
+experts do not fit, loading stops with the memory it would need; if the system
+RAM estimate exceeds the available memory, a warning is printed.
+
+Only the 32 GB row ran on the hardware it describes. The smaller GPUs were not
+tested on real cards (such as an RTX 4090, 5080, 5070 Ti or 5070): they were
+emulated on the RTX 5090 by holding GPU memory with `tests/drama3/vram_hog` so
+that only a smaller card's free memory remained, and system RAM was capped with a
+container memory limit (no swap).
+`context_length` 4096, 16 CPU threads; quality is the share of chunks that
+completed, Whisper character error rate below 0.15:
+
+| GPU (free memory) | System RAM | `auto` CPU layers | GPU peak | System RAM used | RTF (JA long / dialogue / EN long) | Quality |
+|---|---|---|---|---|---|---|
+| 32 GB (30.9 GiB) | 59 GiB | 12 | 28.8 GB | 14 GB | 0.35 / 0.37 / 0.40 | 2 seeds x 3 texts, all complete |
+| 24 GB (23.5 GiB) | 26 GiB cap | 23 | 20.3 GB | 22 GB | 0.49 / 0.52 / 0.55 | 2 seeds x 3, all complete |
+| 16 GB (15.4 GiB) | 59 GiB | 33 | 12.6 GB | 30 GB | 0.60 / 0.63 / 0.68 | 8 seeds x 3, 129/129 chunks, CER <= 2 % |
+| 16 GB (15.4 GiB) | 26 GiB cap | 33 | - | - | - | killed while loading: out of memory |
+| 12 GB (11.5 GiB) | 40 GiB cap | 38 | 8.7 GB | 34 GB | 0.66 / 0.70 / 0.76 | 2 seeds x 3, all complete |
+
+The smaller the GPU, the more system RAM is needed, so the failure in the fourth
+row is a system RAM limit, not a GPU one. A 26 GiB cap stands for a 32 GB machine
+after the operating system, and a 40 GiB cap for a 48 GB machine. So a 24 GB card
+fits in 32 GB of system RAM, while 16 GB and 12 GB cards need about 48 GB.
+
+The emulation keeps the 5090's compute and memory bandwidth, so a real smaller
+card will be slower than these RTFs. The memory figures should carry over, but a
+real card's driver and CUDA context can differ a little, so they are not confirmed
+either. Use 16 CPU
 threads on a 16-core CPU; using all SMT threads was 6x slower.
+
+Packages converted before `auto` existed embed the older model spec, which does
+not know `vram_budget_gb`; pass `--model-spec-override model_specs/fish_drama3.json`
+(or reconvert) to use it.
 
 ## Options added by drama3-lowmem
 
 | Option | Kind | Default | Effect |
 |---|---|---|---|
-| `fish_drama3.cpu_expert_layers` | session | 4 | Expert layers kept and computed on the CPU |
+| `fish_drama3.cpu_expert_layers` | session | `auto` | Expert layers kept in system RAM and computed on the CPU (0-40), or `auto` |
+| `fish_drama3.vram_budget_gb` | session | - | With `auto`, use at most this much GPU memory (GiB) |
 | `fish_drama3.offline_codec` | session | `stream` | Decode offline takes frame by frame (constant VRAM) instead of one graph per take |
 | `fish_drama3.reference_encoder` | session | `cpu` | Encode reference audio on the CPU |
 | `fish_drama3.profile_steps` | session | false | Print the per-frame time split |
@@ -169,14 +213,17 @@ threads on a 16-core CPU; using all SMT threads was 6x slower.
 - `tests/fp8/run_cuda.sh`: CUDA FP8 type, bit-exact against the CPU (and
   `test-backend-ops` covers it: MUL_MAT 1144/1144, MUL_MAT_ID 844/844)
 - `tests/drama3/run.sh`: the on-device sampler against the CPU sampling rule,
-  including boundary cases
+  including boundary cases; sentence chunking; the `auto` expert placement
+- `tests/drama3/vram_hog.cu`: holds GPU memory to emulate a smaller card
+  (`vram_hog <GiB to leave free>`); `scripts/drama3_run_cases.sh` takes
+  `MEMORY_LIMIT` to cap system RAM
 - `tools/reference/`: FP32 and official-numerics reference, compared with
   `tools/community_models/drama3_compare_dumps.py`
 
 ## Limitations
 
-- Tested on one machine (RTX 5090, Linux). Other GPUs, Windows and smaller VRAM
-  configurations are untested.
+- Tested on one machine (RTX 5090, Linux). Smaller GPUs were emulated on it
+  (memory only, not speed); other GPUs and Windows are untested.
 - The quality guards are heuristics on top of the official sampling; they reduce
   but do not eliminate sampling failures, and dialogue turns are generated
   sequentially.
