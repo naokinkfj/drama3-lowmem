@@ -183,5 +183,55 @@ threads on a 16-core CPU; using all SMT threads was 6x slower.
 - The vendored ggml is a fork; the FP8 block type has no upstream counterpart
   (upstream's FP8 proposals keep scales per tensor or per channel, which cannot
   express 128x128 block scales).
-- No hosted service may be built on the weights without a separate license from
-  Fish Audio.
+- A Hosted Service (a service where others generate speech or clone voices from
+  input they supply) needs a separate license from Fish Audio; see Licenses.
+
+## Licenses
+
+- **Code:** Apache License 2.0 ([LICENSE](../LICENSE)), inherited from audio.cpp.
+  [NOTICE](../NOTICE) lists the origin, every file changed by drama3-lowmem and the
+  vendored third-party components.
+- **Weights:** the Drama 3 checkpoint, its codec and every package converted from
+  them are under the Fish Audio Community License v1.0
+  ([copy](../licenses/FISH-AUDIO-COMMUNITY-LICENSE-1.0.md)). In short:
+  - Research, personal and other non-commercial use is free.
+  - Commercial use is free while the total gross revenue of you and your
+    affiliates, from all sources, is below USD 500,000 over the last 12 months
+    (section III(a)). Reaching it requires notice to Fish Audio within 30 days and
+    a separate license after a 90-day transition (III(b)).
+  - A Hosted Service, where third parties generate speech or clone voices from
+    input they supply (an API, or a site or app whose primary purpose is TTS or
+    voice cloning), needs a separate license at any revenue (III(c)). Speaking
+    your own content in your own product, a production service that delivers only
+    finished audio, and a free, unmonetized research or demo service (such as a
+    Hugging Face Space) are not Hosted Services.
+  - Do not clone an identifiable person's voice without consent, and do not use
+    the outputs to train other speech models (IV(b)).
+
+  Read the license itself; this summary is not legal advice.
+
+### Redistributing a converted package
+
+A converted GGUF is a Derivative Work under the Fish Audio Community License.
+To share one (for example on Hugging Face):
+
+1. Ship a copy of the license
+   ([licenses/FISH-AUDIO-COMMUNITY-LICENSE-1.0.md](../licenses/FISH-AUDIO-COMMUNITY-LICENSE-1.0.md))
+   with it.
+2. Ship a `NOTICE` text file that keeps Fish Audio's attribution and says how the
+   materials were changed, for example:
+
+   ```text
+   These Fish Audio Materials are licensed under the Fish Audio Community License, Version 1.0. Copyright © 39 AI, INC. All Rights Reserved.
+
+   Changes (drama3-lowmem): fishaudio/drama-3 converted to GGUF for audio.cpp.
+   Routed-expert FP8 E4M3 bytes are copied unchanged and repacked with one FP32
+   scale per 128 values (ggml type f8_e4m3_b128). BF16 tensors are kept as BF16
+   and 1-D tensors are stored as F32. In the codec, weight normalization is
+   folded into plain weights, which are cast to FP16. The tokenizer and model
+   configuration are embedded in the GGUF. Nothing was retrained or pruned.
+   ```
+
+3. Display "Built with Fish Audio" on the model card.
+4. Name it so its origin is clear (for example "Drama-3-FP8-GGUF"), without the
+   Fish Audio logo and without implying that Fish Audio made or endorses it.

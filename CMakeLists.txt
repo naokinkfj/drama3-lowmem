@@ -1,3 +1,4 @@
+# Modified for drama3-lowmem (2026); see NOTICE.
 cmake_minimum_required(VERSION 3.20)
 
 project(AudioCpp LANGUAGES C CXX)

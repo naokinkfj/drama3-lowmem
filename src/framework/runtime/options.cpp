@@ -1,3 +1,4 @@
+// Modified for drama3-lowmem (2026); see NOTICE.
 #include "engine/framework/runtime/options.h"
 
 #include "engine/framework/assets/tensor_source.h"

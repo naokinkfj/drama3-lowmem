@@ -1,3 +1,4 @@
+# Modified for drama3-lowmem (2026); see NOTICE.
 # /// script
 # requires-python = ">=3.10"
 # dependencies = ["gguf>=0.19", "numpy>=1.26", "safetensors>=0.5", "torch>=2.6"]

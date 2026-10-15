@@ -1,3 +1,4 @@
+// Modified for drama3-lowmem (2026); see NOTICE.
 #include "engine/community_models/fish_drama3/tower.h"
 
 #include "engine/community_models/fish_drama3/sampler_graph.h"

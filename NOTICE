@@ -1,0 +1,115 @@
+drama3-lowmem
+Copyright 2026 Naoki Fujii
+
+Built with Fish Audio.
+
+This product runs Fish Audio Drama 3 on a consumer GPU plus system RAM. It is
+derived from audio.cpp and is licensed under the Apache License, Version 2.0
+(see LICENSE). Model weights are not part of this product and are not covered
+by its license (see "Fish Audio Drama 3" below).
+
+
+Origin
+------
+
+audio.cpp
+  Copyright 2026 ShugoAI LLC
+  Licensed under the Apache License, Version 2.0.
+  https://github.com/0xShug0/audio.cpp
+
+drama3-lowmem starts from JarodMica/audio.cpp, branch drama-3-native, commit
+4dbb4d12 (https://github.com/JarodMica/audio.cpp), a fork of audio.cpp that
+adds the fish_drama3 model port. Neither upstream ships a NOTICE file.
+
+
+Changes made in drama3-lowmem
+-----------------------------
+
+Relative to commit 4dbb4d12:
+
+- A ggml tensor type, GGML_TYPE_F8_E4M3_B128 (FP8 E4M3, 128 values plus one
+  FP32 scale per block), with CPU (AVX-512) and CUDA kernels. Modified ggml
+  files: include/ggml.h, src/ggml.c, src/ggml-common.h, src/ggml-impl.h,
+  src/ggml-quants.c, src/ggml-quants.h, src/ggml-cpu/ggml-cpu.c,
+  src/ggml-cpu/ops.cpp, src/ggml-cpu/quants.c, src/ggml-cpu/quants.h,
+  src/ggml-cuda/common.cuh, src/ggml-cuda/convert.cu,
+  src/ggml-cuda/dequantize.cuh, src/ggml-cuda/getrows.cu,
+  src/ggml-cuda/ggml-cuda.cu, tests/test-backend-ops.cpp (all under
+  external/ggml/). New: src/ggml-cuda/mmv-f8.cu, src/ggml-cuda/mmv-f8.cuh.
+- Registration of that type as a tensor storage type:
+  include/engine/framework/assets/tensor_source.h,
+  src/framework/assets/tensor_source.cpp, src/framework/runtime/options.cpp.
+- The fish_drama3 port: candidate-only LM head, host-side token embedding, a
+  fused audio-tower step with on-device sampling, background codec decoding,
+  CPU reference encoding, sentence and speaker-turn chunking, stall and
+  early-end detection with retries, and teacher-forced dumps. Modified:
+  include/engine/community_models/fish_drama3/{backbone,generator,tower}.h,
+  src/community_models/fish_drama3/{backbone,generator,session,tower}.cpp,
+  model_specs/fish_drama3.json, CMakeLists.txt. New:
+  {include/engine,src}/community_models/fish_drama3/{sampler_graph,text_chunks}.
+- The checkpoint converter keeps the official FP8 expert bytes unchanged:
+  tools/community_models/convert_fish_drama3.py.
+- New tests (tests/fp8, tests/drama3), validation tools
+  (tools/community_models/drama3_*.py, tools/reference), scripts, Dockerfiles,
+  benchmark cases and documentation (README.md, README.ja.md, docs/).
+- The original audio.cpp README moved to UPSTREAM_README.md.
+
+Modified source files carry a one-line "Modified for drama3-lowmem" comment.
+The full history is in the git log.
+
+
+Fish Audio Drama 3
+------------------
+
+These Fish Audio Materials are licensed under the Fish Audio Community License,
+Version 1.0. Copyright © 39 AI, INC. All Rights Reserved.
+
+This repository contains no Fish Audio weights. Users download the official
+checkpoint (https://huggingface.co/fishaudio/drama-3) themselves; the checkpoint,
+its audio codec and any package converted from them remain under the Fish Audio
+Community License, Version 1.0. A copy is in
+licenses/FISH-AUDIO-COMMUNITY-LICENSE-1.0.md (fetched 2026-10-15, SHA-256
+733a32442087acbda12ecafe8e71eb8ee5890c89b50ce7ac4ea3777faa3c823e).
+
+No code in this repository is copied from Fish Speech. The Drama 3 inference
+code follows the model as implemented in SGLang-Omni
+(https://github.com/sgl-project/sglang-omni, sglang_omni/models/fishaudio_drama3,
+Apache License 2.0, Copyright 2025-2026 SGLang-Omni Team). tools/reference is an
+independent FP32 re-implementation for numerical validation, written from that
+code and, for the Qwen3.5-MoE backbone, from SGLang
+(https://github.com/sgl-project/sglang, python/sglang/srt/models/qwen3_5.py,
+qwen2_moe.py, layernorm.py, fla/layernorm_gated.py; Apache License 2.0),
+flash-linear-attention (https://github.com/fla-org/flash-linear-attention, MIT)
+and Hugging Face Transformers (models/qwen3_5_moe, Apache License 2.0, used as a
+cross-check). tools/reference/README.md lists the commits read.
+
+drama3-lowmem is not affiliated with, sponsored or endorsed by Fish Audio.
+
+
+Third-party components
+----------------------
+
+Vendored under external/, each under its own license:
+
+- ggml: MIT, Copyright (c) 2023-2026 The ggml authors (external/ggml/LICENSE).
+  Modified as listed above.
+- llama.cpp tokenizer code (external/llama_tokenizer): MIT, Copyright (c)
+  2023-2026 The ggml authors. audio.cpp ships it without a license file; the
+  llama.cpp license is in licenses/llama.cpp-LICENSE.
+- cJSON: MIT, Copyright (c) 2009-2017 Dave Gamble and cJSON contributors
+  (external/cJSON/LICENSE).
+- cpp-httplib: MIT, Copyright (c) 2017 yhirose (external/cpp-httplib/LICENSE).
+- libyaml: MIT, Copyright (c) 2017-2020 Ingy döt Net, Copyright (c) 2006-2016
+  Kirill Simonov (external/libyaml/License).
+- SentencePiece: Apache License 2.0 (external/sentencepiece/LICENSE).
+
+Other model families that audio.cpp supports keep the licenses of their
+original releases; see docs/model_licenses.md.
+
+
+Audio in docs/report
+--------------------
+
+- The English reference voice is clip common_voice_en_10119832 from Mozilla
+  Common Voice (CC0 1.0), the same clip the Drama 3 model card uses.
+- All other audio was generated with Fish Audio Drama 3 by this project.
