@@ -10,6 +10,10 @@ g++ -std=c++17 -O2 -march=native -fopenmp \
     tests/drama3/test_sampler_graph.cpp src/community_models/fish_drama3/sampler_graph.cpp \
     "$build_dir/ggml/src/libggml-cpu.a" "$build_dir/ggml/src/libggml-base.a" \
     -lpthread -lm -o "$build_dir/tests/test_sampler_graph"
+g++ -std=c++17 -O2 -I include \
+    tests/drama3/test_memory_plan.cpp src/community_models/fish_drama3/memory_plan.cpp \
+    -o "$build_dir/tests/test_memory_plan"
+"$build_dir/tests/test_memory_plan"
 "$build_dir/tests/test_sampler_graph"
 cmake --build "$build_dir" --target engine_runtime -j "$(nproc)" > /dev/null
 g++ -std=c++17 -O2 -I include \

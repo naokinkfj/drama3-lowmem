@@ -1,6 +1,9 @@
 // Modified for drama3-lowmem (2026); see NOTICE.
 #include "engine/community_models/fish_drama3/generator.h"
 
+#include "engine/community_models/fish_drama3/memory_plan.h"
+#include "engine/framework/assets/tensor_source.h"
+#include "engine/framework/core/host_memory.h"
 #include "engine/framework/debug/profiler.h"
 #include "engine/framework/io/json.h"
 #include "engine/framework/runtime/options.h"
@@ -9,6 +12,7 @@
 #include <cmath>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -22,6 +26,100 @@
 
 namespace engine::models::fish_drama3 {
 namespace {
+
+constexpr int64_t kMiB = 1024LL * 1024;
+constexpr int64_t kGiB = 1024 * kMiB;
+
+// GPU memory beyond the weights, measured on an RTX 5090 (CUDA 12.9) with the
+// FP8 package: decode caches and graphs (0.065 MiB per context step) and the
+// prefill graphs of a prompt of s rows (0.329 MiB * s + 17 B * s^2; the
+// backbone keeps an F16 s x s mask). The estimate takes s = context_length,
+// the longest prompt the context allows. The base is negative because the
+// CUDA context (about 500 MiB) is already in use when the free memory is read,
+// and the weight sum counts a little more than is uploaded. Retained prefill
+// graphs are added separately from their cache budgets.
+constexpr double kRuntimeBaseBytes = -256.0 * kMiB;
+constexpr double kRuntimePerStepBytes = 0.394 * kMiB;
+constexpr double kRuntimePerStep2Bytes = 17.1;
+// Left free for the driver and anything else that grows after loading.
+constexpr int64_t kAutoSafetyMarginBytes = 768 * kMiB;
+// System RAM besides the CPU-resident experts and the token embedding: the
+// CPU reference encoder, the tokenizer, request buffers.
+constexpr int64_t kHostOverheadBytes = 3 * kGiB;
+
+int64_t tensor_bytes(const assets::TensorMetadata & tensor) {
+    const ggml_type type = assets::ggml_type_for_tensor_dtype(tensor.dtype);
+    int64_t elements = 1;
+    for (const auto dim : tensor.shape) elements *= dim;
+    return elements / ggml_blck_size(type) * static_cast<int64_t>(ggml_type_size(type));
+}
+
+// Splits the package by where load_qwen35_weights and the codec put it.
+ExpertPlacementRequest describe_weights(const Drama3Assets & assets, const Drama3BackboneDecoderConfig & config,
+                                        bool codec_on_gpu) {
+    ExpertPlacementRequest request;
+    request.expert_layer_bytes.assign(static_cast<size_t>(config.layers), 0);
+    const std::string layers_prefix = config.weight_prefix + ".layers.";
+    const std::string embedding = config.weight_prefix + ".embed_tokens.weight";
+    const std::string lm_head = config.lm_head_prefix + ".weight";
+    int64_t gpu = 0;
+    int64_t host = 0;
+    for (const auto & tensor : assets.model_weights->tensors()) {
+        const auto & name = tensor.name;
+        if (name == embedding) {
+            host += tensor_bytes(tensor);
+        } else if (name == lm_head && config.lm_head_count > 0) {
+            // Only the candidate rows reach the GPU, as F32.
+            gpu += (config.lm_head_count + 1) * config.hidden_size * static_cast<int64_t>(sizeof(float));
+        } else if (name.rfind(layers_prefix, 0) == 0 && name.find(".mlp.experts.") != std::string::npos) {
+            const auto layer = std::stoll(name.substr(layers_prefix.size()));
+            if (layer < 0 || layer >= config.layers) throw std::runtime_error("Drama 3 expert tensor outside the layer range: " + name);
+            request.expert_layer_bytes[static_cast<size_t>(layer)] += tensor_bytes(tensor);
+        } else {
+            gpu += tensor_bytes(tensor);
+        }
+    }
+    int64_t codec = 0;
+    for (const auto & tensor : assets.codec_weights->tensors()) codec += tensor_bytes(tensor);
+    if (codec_on_gpu) gpu += codec;
+    request.gpu_fixed_bytes = gpu;
+    // The CPU reference encoder keeps its own copy of the codec.
+    request.host_fixed_bytes = host + codec + kHostOverheadBytes;
+    return request;
+}
+
+int64_t auto_cpu_expert_layers(const Drama3Assets & assets, const Drama3BackboneDecoderConfig & config,
+                               core::ExecutionContext & execution, const runtime::SessionOptions & options,
+                               bool codec_on_gpu, int64_t backbone_prefill_cache_mb, int64_t tower_prefill_cache_mb) {
+    auto request = describe_weights(assets, config, codec_on_gpu);
+    if (const auto budget = runtime::parse_positive_finite_float_option(options.options, {"fish_drama3.vram_budget_gb"})) {
+        request.vram_budget_bytes = static_cast<int64_t>(static_cast<double>(*budget) * static_cast<double>(kGiB));
+    }
+    // A CPU backend keeps every expert layer in system RAM anyway.
+    if (execution.backend_type() == core::BackendType::Cpu) return 0;
+    const auto memory = execution.memory_snapshot();
+    request.vram_known = memory.available;
+    request.free_vram_bytes = memory.free_bytes;
+    const double context = static_cast<double>(config.decode_cache_steps);
+    request.gpu_fixed_bytes += static_cast<int64_t>(kRuntimeBaseBytes + kRuntimePerStepBytes * context +
+                                                    kRuntimePerStep2Bytes * context * context) +
+                               (backbone_prefill_cache_mb + tower_prefill_cache_mb) * kMiB + kAutoSafetyMarginBytes;
+    const auto plan = plan_expert_placement(request);
+    char line[256];
+    std::snprintf(line, sizeof(line),
+                  "[fish_drama3] cpu_expert_layers=auto -> %lld (VRAM budget %.1f GiB, estimated GPU peak %.1f GiB, "
+                  "system RAM %.1f GiB, context_length %lld)\n",
+                  static_cast<long long>(plan.cpu_expert_layers), static_cast<double>(plan.budget_bytes) / kGiB,
+                  static_cast<double>(plan.gpu_bytes) / kGiB, static_cast<double>(plan.host_bytes) / kGiB,
+                  static_cast<long long>(config.decode_cache_steps));
+    std::cerr << line;
+    const auto host_available = static_cast<int64_t>(core::available_host_memory_bytes());
+    if (host_available > 0 && plan.host_bytes > host_available) {
+        std::cerr << "[fish_drama3] warning: about " << plan.host_bytes / kGiB << " GiB of system RAM is needed but only "
+                  << host_available / kGiB << " GiB is available\n";
+    }
+    return plan.cpu_expert_layers;
+}
 
 int32_t sample(const std::vector<float> & logits, float temperature, int top_k,
                float top_p, std::mt19937 & random) {
@@ -176,7 +274,6 @@ Drama3Generator::Drama3Generator(std::shared_ptr<const Drama3Assets> assets,
     backbone_config.lm_head_eos = assets_->eos;
     backbone_config.lm_head_first = assets_->tower.semantic_begin;
     backbone_config.lm_head_count = static_cast<int32_t>(assets_->tower.codebook_size);
-    backbone_config.cpu_expert_layers = runtime::parse_i64_option(options.options, {"fish_drama3.cpu_expert_layers"}).value_or(4);
     if (const auto value = runtime::find_option(options.options, {"fish_drama3.profile_steps"})) {
         profile_steps_ = runtime::parse_bool_option(*value, "fish_drama3.profile_steps");
     }
@@ -190,17 +287,27 @@ Drama3Generator::Drama3Generator(std::shared_ptr<const Drama3Assets> assets,
     if (backbone_prefill_cache_mb < 0 || backbone_prefill_cache_mb > 4096) throw std::runtime_error("Drama 3 backbone_prefill_cache_mb must be between 0 and 4096");
     backbone_config.prefill_cache_bytes = static_cast<size_t>(backbone_prefill_cache_mb) * 1024u * 1024u;
     backbone_config.profile_prefill_cache = profile_first_audio_;
-    backbone_ = std::make_unique<Drama3BackboneDecoderRuntime>(assets_->model_weights, backbone_config, execution,
-        64 * 1024 * 1024, 8 * 1024 * 1024, assets::TensorStorageType::Native);
     const auto tower_prefill_cache_mb = runtime::parse_i64_option(options.options, {"fish_drama3.tower_prefill_cache_mb"}).value_or(256);
     if (tower_prefill_cache_mb < 0 || tower_prefill_cache_mb > 4096) throw std::runtime_error("Drama 3 tower_prefill_cache_mb must be between 0 and 4096");
-    tower_ = std::make_unique<Drama3Tower>(assets_->model_weights, assets_->tower, execution, cache_steps_,
-        static_cast<size_t>(tower_prefill_cache_mb) * 1024u * 1024u);
     auto codec_backend = options.backend;
     if (const auto value = runtime::find_option(options.options, {"fish_drama3.codec_backend"})) {
         if (*value == "cpu") codec_backend.type = core::BackendType::Cpu;
         else if (*value != "same") throw std::runtime_error("fish_drama3.codec_backend requires cpu or same");
     }
+    const auto expert_layers = parse_cpu_expert_layers(
+        runtime::find_option(options.options, {"fish_drama3.cpu_expert_layers"}).value_or("auto"));
+    // A whole-take codec graph grows with the take (about 8 GiB for 30 s), which
+    // the automatic placement cannot bound.
+    if (!expert_layers && !offline_codec_stream_ && codec_backend.type != core::BackendType::Cpu) {
+        throw std::runtime_error("fish_drama3.offline_codec=full on the GPU needs an explicit fish_drama3.cpu_expert_layers");
+    }
+    backbone_config.cpu_expert_layers = expert_layers ? *expert_layers
+        : auto_cpu_expert_layers(*assets_, backbone_config, execution, options,
+                                 codec_backend.type != core::BackendType::Cpu, backbone_prefill_cache_mb, tower_prefill_cache_mb);
+    backbone_ = std::make_unique<Drama3BackboneDecoderRuntime>(assets_->model_weights, backbone_config, execution,
+        64 * 1024 * 1024, 8 * 1024 * 1024, assets::TensorStorageType::Native);
+    tower_ = std::make_unique<Drama3Tower>(assets_->model_weights, assets_->tower, execution, cache_steps_,
+        static_cast<size_t>(tower_prefill_cache_mb) * 1024u * 1024u);
     codec_execution_ = std::make_unique<core::ExecutionContext>(codec_backend);
     codecs::FishDacCodecRuntimeOptions codec_options;
     codec_options.weight_context_bytes = 16 * 1024 * 1024;

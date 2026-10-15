@@ -198,12 +198,17 @@
       },
       {
         "name": "cpu_expert_layers",
-        "type": "int",
-        "description": "Number of the 40 expert banks kept and evaluated on CPU; use 4 for a 24 GB profile or 24 for a 16 GB profile. Dense layers and the tower use the selected backend.",
+        "type": "string",
+        "description": "Number of the 40 expert layers kept in system RAM and evaluated on the CPU (0-40), or auto to pick the fewest that let the rest fit the free GPU memory (or vram_budget_gb). Dense layers and the tower use the selected backend.",
         "required": false,
-        "min": 0,
-        "max": 40,
-        "default": 4
+        "default": "auto"
+      },
+      {
+        "name": "vram_budget_gb",
+        "type": "float",
+        "description": "With cpu_expert_layers=auto, use at most this much GPU memory (GiB), for example to leave room for a desktop or another program.",
+        "required": false,
+        "min": 1
       },
       {
         "name": "codec_backend",
