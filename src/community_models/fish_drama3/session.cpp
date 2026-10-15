@@ -222,6 +222,7 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
     std::vector<Drama3Take> generated_takes;
     const auto started = std::chrono::steady_clock::now();
     bool limited = false;
+    int64_t failed_chunks = 0;
     for (size_t index = 0; index < chunks.size(); ++index) {
         auto chunk_sampling = sampling;
         chunk_sampling.seed += static_cast<uint32_t>(index);
@@ -244,7 +245,8 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
             return take.stalled || (!take.reached_limit && seconds < min_seconds);
         };
         // Streamed audio has already left, so only offline takes are retried.
-        for (int64_t attempt = 1; failed(generated) && !streaming && attempt <= retries; ++attempt) {
+        int64_t attempt = 1;
+        for (; failed(generated) && !streaming && attempt <= retries; ++attempt) {
             std::cerr << "[fish_drama3] take " << (generated.stalled ? "stalled" : "ended early")
                       << "; regenerating chunk " << index << " (attempt " << attempt << ")\n";
             chunk_sampling.seed += 7919U;
@@ -255,6 +257,14 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
                 std::cerr << "[fish_drama3] retry failed: " << error.what() << '\n';
             }
         }
+        // The final state of every chunk, so a take that still stalls after
+        // its retries is visible in the log and in the result.
+        const char * outcome = "ok";
+        if (failed(generated)) {
+            ++failed_chunks;
+            outcome = generated.stalled ? "stalled" : "ended early";
+        }
+        std::cerr << "[fish_drama3] chunk " << index << " final: " << outcome << " after " << attempt - 1 << " retries\n";
         runtime::append_audio_buffer(merged, generated.audio);
         limited = limited || generated.reached_limit;
         generated_takes.push_back({text, std::move(generated.codes)});
@@ -266,6 +276,7 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
     result.custom_schema_output = runtime::CustomSchemaOutput{"drama3_generation_v1", json::Value::make_object({
         {"frames", json::Value::make_number(take.codes.frames)},
         {"reached_limit", json::Value::make_bool(limited)},
+        {"failed_chunks", json::Value::make_number(failed_chunks)},
         {"wall_ms", json::Value::make_number(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count())}})};
     return result;
 }
